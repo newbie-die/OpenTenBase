@@ -128,6 +128,13 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	TupleTableSlot *slot = so->vslot;
 	int			batchProbes = 0;
 
+#ifdef IVFFLAT_BENCH
+	instr_time	getitems_start;
+
+	INSTR_TIME_SET_CURRENT(getitems_start);
+	so->profile_getitems_calls++;
+#endif
+
 	tuplesort_reset(so->sortstate);
 
 	/* Search closest probes lists */
@@ -142,6 +149,10 @@ GetScanItems(IndexScanDesc scan, Datum value)
 			Page		page;
 			OffsetNumber maxoffno;
 
+#ifdef IVFFLAT_BENCH
+			so->profile_pages++;
+#endif
+
 			buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, searchPage, RBM_NORMAL, so->bas);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
@@ -153,6 +164,13 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				Datum		datum;
 				bool		isnull;
 				ItemId		itemid = PageGetItemId(page, offno);
+#ifdef IVFFLAT_BENCH
+				instr_time	candidate_start;
+				instr_time	distance_start;
+				instr_time	elapsed;
+
+				INSTR_TIME_SET_CURRENT(candidate_start);
+#endif
 
 				itup = (IndexTuple) PageGetItem(page, itemid);
 				datum = index_getattr(itup, 1, tupdesc, &isnull);
@@ -164,13 +182,27 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				 * performance
 				 */
 				ExecClearTuple(slot);
+#ifdef IVFFLAT_BENCH
+				INSTR_TIME_SET_CURRENT(distance_start);
+#endif
 				slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
+#ifdef IVFFLAT_BENCH
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, distance_start);
+				so->profile_distance_us += INSTR_TIME_GET_MICROSEC(elapsed);
+#endif
 				slot->tts_isnull[0] = false;
 				slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
 				slot->tts_isnull[1] = false;
 				ExecStoreVirtualTuple(slot);
 
 				tuplesort_puttupleslot(so->sortstate, slot);
+#ifdef IVFFLAT_BENCH
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, candidate_start);
+				so->profile_candidate_us += INSTR_TIME_GET_MICROSEC(elapsed);
+				so->profile_candidates++;
+#endif
 			}
 
 			searchPage = IvfflatPageGetOpaque(page)->nextblkno;
@@ -179,7 +211,30 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		}
 	}
 
+#ifdef IVFFLAT_BENCH
+	{
+		instr_time	sort_start;
+		instr_time	elapsed;
+
+		INSTR_TIME_SET_CURRENT(sort_start);
+		tuplesort_performsort(so->sortstate);
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, sort_start);
+		so->profile_sort_us += INSTR_TIME_GET_MICROSEC(elapsed);
+	}
+#else
 	tuplesort_performsort(so->sortstate);
+#endif
+
+#ifdef IVFFLAT_BENCH
+	{
+		instr_time	elapsed;
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, getitems_start);
+		so->profile_getitems_us += INSTR_TIME_GET_MICROSEC(elapsed);
+	}
+#endif
 
 #if defined(IVFFLAT_MEMORY)
 	elog(INFO, "memory: %zu MB", MemoryContextMemAllocated(CurrentMemoryContext, true) / (1024 * 1024));
@@ -322,6 +377,19 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->listIndex = 0;
 	so->lists = palloc_array_checked(IvfflatScanList, maxProbes);
 
+	// profiling 检测查询耗时
+		/* Initialize profiling counters */
+	so->profile_candidates = 0;
+	so->profile_pages = 0;
+	so->profile_getitems_calls = 0;
+
+	so->profile_list_us = 0.0;
+	so->profile_getitems_us = 0.0;
+	so->profile_candidate_us = 0.0;
+	so->profile_distance_us = 0.0;
+	so->profile_sort_us = 0.0;
+	so->profile_return_us = 0.0;
+
 	MemoryContextSwitchTo(oldCtx);
 
 	scan->opaque = so;
@@ -391,18 +459,47 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 			elog(ERROR, "non-MVCC snapshots are not supported with ivfflat");
 
 		value = GetScanValue(scan);
-		IvfflatBench("GetScanLists", GetScanLists(scan, value));
-		IvfflatBench("GetScanItems", GetScanItems(scan, value));
+#ifdef IVFFLAT_BENCH
+		{
+			instr_time	start;
+			instr_time	elapsed;
+
+			INSTR_TIME_SET_CURRENT(start);
+			GetScanLists(scan, value);
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, start);
+			so->profile_list_us += INSTR_TIME_GET_MICROSEC(elapsed);
+		}
+#else
+		GetScanLists(scan, value);
+#endif
+		GetScanItems(scan, value);
 		so->first = false;
 		so->value = value;
 	}
 
-	while (!tuplesort_gettupleslot(so->sortstate, true, false, so->mslot, NULL))
+	for (;;)
 	{
+		bool		found;
+#ifdef IVFFLAT_BENCH
+		instr_time	start;
+		instr_time	elapsed;
+
+		INSTR_TIME_SET_CURRENT(start);
+#endif
+		found = tuplesort_gettupleslot(so->sortstate, true, false, so->mslot, NULL);
+#ifdef IVFFLAT_BENCH
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, start);
+		so->profile_return_us += INSTR_TIME_GET_MICROSEC(elapsed);
+#endif
+		if (found)
+			break;
+
 		if (so->listIndex == so->maxProbes)
 			return false;
 
-		IvfflatBench("GetScanItems", GetScanItems(scan, so->value));
+		GetScanItems(scan, so->value);
 	}
 
 	heaptid = (ItemPointer) DatumGetPointer(slot_getattr(so->mslot, 2, &isnull));
@@ -420,6 +517,17 @@ void
 ivfflatendscan(IndexScanDesc scan)
 {
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+
+#ifdef IVFFLAT_BENCH
+	elog(INFO, "IVFFLAT_PROFILE candidates=%llu pages=%llu getitems_calls=%llu list_us=%.3f getitems_us=%.3f candidate_us=%.3f distance_us=%.3f sort_us=%.3f return_us=%.3f scan_us=%.3f",
+		 (unsigned long long) so->profile_candidates,
+		 (unsigned long long) so->profile_pages,
+		 (unsigned long long) so->profile_getitems_calls,
+		 so->profile_list_us, so->profile_getitems_us,
+		 so->profile_candidate_us, so->profile_distance_us,
+		 so->profile_sort_us, so->profile_return_us,
+		 so->profile_list_us + so->profile_getitems_us + so->profile_return_us);
+#endif
 
 	/* Free any temporary files */
 	tuplesort_end(so->sortstate);

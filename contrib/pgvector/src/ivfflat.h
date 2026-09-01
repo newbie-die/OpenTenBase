@@ -306,6 +306,17 @@ typedef struct IvfflatScanOpaqueData
 	Oid			collation;
 	Datum		(*distfunc) (FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2);
 
+	/* profiling 检测查询耗时 */
+	uint64		profile_candidates;
+	uint64		profile_pages;
+	uint64		profile_getitems_calls;
+	double		profile_list_us;
+	double		profile_getitems_us;
+	double		profile_candidate_us;
+	double		profile_distance_us;
+	double		profile_sort_us;
+	double		profile_return_us;
+
 	/* Lists */
 	pairingheap *listQueue;
 	BlockNumber *listPages;
