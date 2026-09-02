@@ -110,6 +110,7 @@ typedef Pointer Item;
 extern int	ivfflat_probes;
 extern int	ivfflat_iterative_scan;
 extern int	ivfflat_max_probes;
+extern int	ivfflat_experimental_sort_bound;
 
 typedef enum IvfflatIterativeScanMode
 {
@@ -295,6 +296,7 @@ typedef struct IvfflatScanOpaqueData
 
 	/* Sorting */
 	Tuplesortstate *sortstate;
+	int			sortBound;
 	TupleDesc	tupdesc;
 	TupleTableSlot *vslot;
 	TupleTableSlot *mslot;

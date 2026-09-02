@@ -136,6 +136,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #endif
 
 	tuplesort_reset(so->sortstate);
+	/* tuplesort_reset() clears the per-batch bounded state */
+	if (so->sortBound > 0)
+		tuplesort_set_bound(so->sortstate, so->sortBound);
 
 	/* Search closest probes lists */
 	while (so->listIndex < so->maxProbes && (++batchProbes) <= so->probes)
@@ -291,14 +294,20 @@ GetScanValue(IndexScanDesc scan)
  * Initialize scan sort state
  */
 static Tuplesortstate *
-InitScanSortState(TupleDesc tupdesc)
+InitScanSortState(TupleDesc tupdesc, int bound)
 {
 	AttrNumber	attNums[] = {1};
 	Oid			sortOperators[] = {Float8LessOperator};
 	Oid			sortCollations[] = {InvalidOid};
 	bool		nullsFirstFlags[] = {false};
+	Tuplesortstate *sortstate;
+	int			sortopt = bound > 0 ? TUPLESORT_ALLOWBOUNDED : TUPLESORT_NONE;
 
-	return tuplesort_begin_heap(tupdesc, 1, attNums, sortOperators, sortCollations, nullsFirstFlags, work_mem, NULL, false);
+	sortstate = tuplesort_begin_heap(tupdesc, 1, attNums, sortOperators, sortCollations, nullsFirstFlags, work_mem, NULL, sortopt);
+	if (bound > 0)
+		tuplesort_set_bound(sortstate, bound);
+
+	return sortstate;
 }
 
 /*
@@ -337,6 +346,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->probes = probes;
 	so->maxProbes = maxProbes;
 	so->dimensions = dimensions;
+	so->sortBound = ivfflat_experimental_sort_bound;
 	so->value = PointerGetDatum(NULL);
 
 	/* Set support functions */
@@ -359,7 +369,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 #endif
 
 	/* Prep sort */
-	so->sortstate = InitScanSortState(so->tupdesc);
+	so->sortstate = InitScanSortState(so->tupdesc, so->sortBound);
 
 	/* Need separate slots for puttuple and gettuple */
 	so->vslot = MakeSingleTupleTableSlot(so->tupdesc, &TTSOpsVirtual);
@@ -519,7 +529,8 @@ ivfflatendscan(IndexScanDesc scan)
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 
 #ifdef IVFFLAT_BENCH
-	elog(INFO, "IVFFLAT_PROFILE candidates=%llu pages=%llu getitems_calls=%llu list_us=%.3f getitems_us=%.3f candidate_us=%.3f distance_us=%.3f sort_us=%.3f return_us=%.3f scan_us=%.3f",
+	elog(INFO, "IVFFLAT_PROFILE probes=%d dimensions=%d sort_bound=%d candidates=%llu pages=%llu getitems_calls=%llu list_us=%.3f getitems_us=%.3f candidate_us=%.3f distance_us=%.3f sort_us=%.3f return_us=%.3f scan_us=%.3f",
+		 so->probes, so->dimensions, so->sortBound,
 		 (unsigned long long) so->profile_candidates,
 		 (unsigned long long) so->profile_pages,
 		 (unsigned long long) so->profile_getitems_calls,
