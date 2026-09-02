@@ -900,6 +900,12 @@ ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
 			sortState->bound = tuples_needed;
 		}
 	}
+	else if (IsA(child_node, IndexScanState))
+	{
+		IndexScanState *indexState = (IndexScanState *) child_node;
+
+		indexState->iss_TupleBound = tuples_needed;
+	}
 	else if (IsA(child_node, AppendState))
 	{
 		/*

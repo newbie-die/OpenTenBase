@@ -113,6 +113,7 @@ IndexNext(IndexScanState *node)
 								   node->iss_NumScanKeys,
 								   node->iss_NumOrderByKeys);
 
+		scandesc->xs_tuple_bound = node->iss_TupleBound;
 		node->iss_ScanDesc = scandesc;
 
 		/*
@@ -209,6 +210,7 @@ IndexNextWithReorder(IndexScanState *node)
 								   node->iss_NumScanKeys,
 								   node->iss_NumOrderByKeys);
 
+		scandesc->xs_tuple_bound = node->iss_TupleBound;
 		node->iss_ScanDesc = scandesc;
 
 		/*
@@ -584,9 +586,12 @@ ExecReScanIndexScan(IndexScanState *node)
 
 	/* reset index scan */
 	if (node->iss_ScanDesc)
+	{
+		node->iss_ScanDesc->xs_tuple_bound = node->iss_TupleBound;
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+	}
 	node->iss_ReachedEnd = false;
 
 	ExecScanReScan(&node->ss);
@@ -919,6 +924,7 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	indexstate->ss.ps.plan = (Plan *) node;
 	indexstate->ss.ps.state = estate;
 	indexstate->ss.ps.ExecProcNode = ExecIndexScan;
+	indexstate->iss_TupleBound = -1;
 
 	/*
 	 * Miscellaneous initialization
@@ -1726,6 +1732,7 @@ ExecIndexScanInitializeDSM(IndexScanState *node,
 								 node->iss_NumScanKeys,
 								 node->iss_NumOrderByKeys,
 								 piscan);
+	node->iss_ScanDesc->xs_tuple_bound = node->iss_TupleBound;
 
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass
@@ -1790,6 +1797,7 @@ ExecIndexScanInitializeWorker(IndexScanState *node,
 								 node->iss_NumScanKeys,
 								 node->iss_NumOrderByKeys,
 								 piscan);
+	node->iss_ScanDesc->xs_tuple_bound = node->iss_TupleBound;
 
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass

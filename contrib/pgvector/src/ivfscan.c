@@ -347,6 +347,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->maxProbes = maxProbes;
 	so->dimensions = dimensions;
 	so->sortBound = ivfflat_experimental_sort_bound;
+	so->logicalBound = -1;
 	so->value = PointerGetDatum(NULL);
 
 	/* Set support functions */
@@ -415,6 +416,7 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 {
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 
+	so->logicalBound = scan->xs_tuple_bound;
 	so->first = true;
 	pairingheap_reset(so->listQueue);
 	so->listIndex = 0;
@@ -529,8 +531,8 @@ ivfflatendscan(IndexScanDesc scan)
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 
 #ifdef IVFFLAT_BENCH
-	elog(INFO, "IVFFLAT_PROFILE probes=%d dimensions=%d sort_bound=%d candidates=%llu pages=%llu getitems_calls=%llu list_us=%.3f getitems_us=%.3f candidate_us=%.3f distance_us=%.3f sort_us=%.3f return_us=%.3f scan_us=%.3f",
-		 so->probes, so->dimensions, so->sortBound,
+	elog(INFO, "IVFFLAT_PROFILE probes=%d dimensions=%d sort_bound=%d logical_bound=" INT64_FORMAT " candidates=%llu pages=%llu getitems_calls=%llu list_us=%.3f getitems_us=%.3f candidate_us=%.3f distance_us=%.3f sort_us=%.3f return_us=%.3f scan_us=%.3f",
+		 so->probes, so->dimensions, so->sortBound, so->logicalBound,
 		 (unsigned long long) so->profile_candidates,
 		 (unsigned long long) so->profile_pages,
 		 (unsigned long long) so->profile_getitems_calls,

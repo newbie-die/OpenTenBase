@@ -333,6 +333,7 @@ index_beginscan_internal(Relation indexRelation,
 	 */
 	scan = indexRelation->rd_indam->ambeginscan(indexRelation, nkeys,
 												norderbys);
+	scan->xs_tuple_bound = -1;
 	/* Initialize information for parallel scan. */
 	scan->parallel_scan = pscan;
 	scan->xs_temp_snap = temp_snap;

@@ -140,6 +140,7 @@ typedef struct IndexScanDescData
 	int			numberOfOrderBys;	/* number of ordering operators */
 	struct ScanKeyData *keyData;	/* array of index qualifier descriptors */
 	struct ScanKeyData *orderByData;	/* array of ordering op descriptors */
+	int64		xs_tuple_bound;	/* maximum tuples requested, or -1 */
 	bool		xs_want_itup;	/* caller requests index tuples */
 	bool		xs_temp_snap;	/* unregister snapshot at scan end? */
 

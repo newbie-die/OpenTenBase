@@ -297,6 +297,7 @@ typedef struct IvfflatScanOpaqueData
 	/* Sorting */
 	Tuplesortstate *sortstate;
 	int			sortBound;
+	int64		logicalBound;
 	TupleDesc	tupdesc;
 	TupleTableSlot *vslot;
 	TupleTableSlot *mslot;
