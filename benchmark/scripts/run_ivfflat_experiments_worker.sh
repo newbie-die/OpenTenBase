@@ -2,19 +2,26 @@
 set -euo pipefail
 
 PHASE=${1:-all}
-BENCHMARK_ROOT=${BENCHMARK_ROOT:-/workspace/benchmark}
-RUN_ROOT=${RUN_ROOT:-"${BENCHMARK_ROOT}/runs"}
+SCRIPT_DIR=$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+    pwd -P
+)
+BENCHMARK_ROOT=${BENCHMARK_ROOT:-"$(dirname -- "${SCRIPT_DIR}")"}
+REPO_ROOT=${REPO_ROOT:-"$(dirname -- "${BENCHMARK_ROOT}")"}
+WORKSPACE_ROOT=${WORKSPACE_ROOT:-"$(dirname -- "${REPO_ROOT}")"}
+BENCHMARK_RUNTIME_ROOT=${BENCHMARK_RUNTIME_ROOT:-"${WORKSPACE_ROOT}/benchmark"}
+RUN_ROOT=${RUN_ROOT:-"${BENCHMARK_RUNTIME_ROOT}/runs"}
 RUN_DIR=${RUN_DIR:?RUN_DIR must be set by the launcher}
 PID_FILE=${PID_FILE:-"${RUN_ROOT}/ivfflat-profile.pid"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
-PGVECTOR_ROOT=${PGVECTOR_ROOT:-/workspace/OpenTenBase/contrib/pgvector}
-PG_CONFIG=${PG_CONFIG:-/workspace/install/bin/pg_config}
-PG_CTL=${PG_CTL:-/workspace/install/bin/pg_ctl}
-PGDATA=${PGDATA:-/workspace/data}
+PGVECTOR_ROOT=${PGVECTOR_ROOT:-"${REPO_ROOT}/contrib/pgvector"}
+PG_CONFIG=${PG_CONFIG:-"${WORKSPACE_ROOT}/install/bin/pg_config"}
+PG_CTL=${PG_CTL:-"${WORKSPACE_ROOT}/install/bin/pg_ctl"}
+PGDATA=${PGDATA:-"${WORKSPACE_ROOT}/data"}
 PG_OS_USER=${PG_OS_USER:-dev}
 LISTS=${LISTS:-1000}
 INSTALL_DEPS=${INSTALL_DEPS:-1}
-VENV_DIR=${VENV_DIR:-"${BENCHMARK_ROOT}/.venv"}
+VENV_DIR=${VENV_DIR:-"${BENCHMARK_RUNTIME_ROOT}/.venv"}
 WARMUP=${WARMUP:-100}
 QUERIES=${QUERIES:-1000}
 TOPK=${TOPK:-10}
@@ -60,15 +67,17 @@ for executable in "${PYTHON_BIN}" "${PG_CONFIG}" "${PG_CTL}"; do
 done
 
 if ! "${PYTHON_BIN}" -c 'import h5py, numpy, psycopg2' 2>/dev/null; then
+    REQUIREMENTS_FILE="${BENCHMARK_RUNTIME_ROOT}/requirements.txt"
     if [[ "${INSTALL_DEPS}" != "1" ]]; then
-        echo "missing Python dependencies; install ${BENCHMARK_ROOT}/requirements.txt" >&2
+        echo "missing Python dependencies; install ${REQUIREMENTS_FILE}" >&2
         exit 1
     fi
     echo "[$(date -u --iso-8601=seconds)] install Python dependencies into ${VENV_DIR}"
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"
     PYTHON_BIN="${VENV_DIR}/bin/python"
-    env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy "${PYTHON_BIN}" -m pip install -r "${BENCHMARK_ROOT}/requirements.txt"
+    env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy "${PYTHON_BIN}" -m pip install -r "${REQUIREMENTS_FILE}"
 fi
+export BENCHMARK_RUNTIME_ROOT
 test -f "${PROFILE_SCRIPT}"
 test -d "${PGVECTOR_ROOT}"
 test -d "${PGDATA}"

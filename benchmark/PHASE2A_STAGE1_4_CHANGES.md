@@ -403,14 +403,14 @@ contrib/pgvector/src/ivfflat.h
 contrib/pgvector/src/ivfscan.c
 ```
 
-### 7.3 Benchmark runtime 脚本
+### 7.3 Benchmark runner
 
-实际运行脚本位于独立路径，不属于当前 OpenTenBase Git worktree：
+实际运行脚本位于当前 OpenTenBase Git worktree：
 
 ```text
-/workspace/benchmark/scripts/ivfflat_profile.py
-/workspace/benchmark/scripts/run_ivfflat_experiments.sh
-/workspace/benchmark/scripts/run_ivfflat_experiments_worker.sh
+/workspace/OpenTenBase/benchmark/scripts/ivfflat_profile.py
+/workspace/OpenTenBase/benchmark/scripts/run_ivfflat_experiments.sh
+/workspace/OpenTenBase/benchmark/scripts/run_ivfflat_experiments_worker.sh
 ```
 
 这些脚本新增 `phase=2a2` 和 `phase=2a34`，并复用同一 launcher/worker，没有创建完整平行 runner。

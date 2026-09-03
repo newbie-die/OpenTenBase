@@ -3,12 +3,17 @@
 
 import argparse
 import csv
+import os
 import re
 import statistics
 import time
 from pathlib import Path
 
-ROOT = Path("/workspace/benchmark")
+SCRIPT_ROOT = Path(__file__).resolve().parent.parent
+WORKSPACE_ROOT = SCRIPT_ROOT.parent.parent
+ROOT = Path(
+    os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")
+).resolve()
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE\s+(.*)")
 FIELD_RE = re.compile(r"([a-z_]+)=(-?[0-9.]+)")
 PROBES = (1, 2, 4, 8, 16, 32, 64, 128, 256)

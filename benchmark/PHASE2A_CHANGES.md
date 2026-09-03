@@ -124,7 +124,7 @@ if (so->sortBound > 0)
 
 ## 3. Benchmark 代码更改
 
-所有正式脚本副本位于 `benchmark/scripts/`，运行时 canonical 路径仍为 `/workspace/benchmark/scripts/`，两处内容已同步。
+所有正式脚本位于 `benchmark/scripts/`，运行时默认根目录由脚本自身位置推导，也可通过 `BENCHMARK_ROOT` 覆盖。
 
 ### 3.1 Launcher
 
@@ -138,7 +138,7 @@ if (so->sortBound > 0)
 启动命令：
 
 ```bash
-/workspace/benchmark/scripts/run_ivfflat_experiments.sh 2a
+/workspace/OpenTenBase/benchmark/scripts/run_ivfflat_experiments.sh 2a
 ```
 
 ### 3.2 Worker
@@ -347,7 +347,7 @@ SQL LIMIT 10 != IVFFlat 内部安全 bound 10
 默认正式实验：
 
 ```bash
-/workspace/benchmark/scripts/run_ivfflat_experiments.sh 2a
+/workspace/OpenTenBase/benchmark/scripts/run_ivfflat_experiments.sh 2a
 ```
 
 缩小矩阵进行 smoke test：
@@ -358,7 +358,7 @@ PHASE2A_BOUNDS=0,10 \
 PHASE2A_ROUNDS=1 \
 PHASE2A_WARMUP=10 \
 PHASE2A_QUERIES=100 \
-/workspace/benchmark/scripts/run_ivfflat_experiments.sh 2a
+/workspace/OpenTenBase/benchmark/scripts/run_ivfflat_experiments.sh 2a
 ```
 
 查看日志：

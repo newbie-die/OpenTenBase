@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BENCHMARK_ROOT=${BENCHMARK_ROOT:-/workspace/benchmark}
-RUN_ROOT=${RUN_ROOT:-"${BENCHMARK_ROOT}/runs"}
+SCRIPT_DIR=$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+    pwd -P
+)
+BENCHMARK_ROOT=${BENCHMARK_ROOT:-"$(dirname -- "${SCRIPT_DIR}")"}
+REPO_ROOT=${REPO_ROOT:-"$(dirname -- "${BENCHMARK_ROOT}")"}
+WORKSPACE_ROOT=${WORKSPACE_ROOT:-"$(dirname -- "${REPO_ROOT}")"}
+BENCHMARK_RUNTIME_ROOT=${BENCHMARK_RUNTIME_ROOT:-"${WORKSPACE_ROOT}/benchmark"}
+RUN_ROOT=${RUN_ROOT:-"${BENCHMARK_RUNTIME_ROOT}/runs"}
 WORKER=${WORKER:-"${BENCHMARK_ROOT}/scripts/run_ivfflat_experiments_worker.sh"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 PHASE=${1:-all}
@@ -29,6 +36,7 @@ mkdir -p "${RUN_DIR}"
 
 nohup env \
     BENCHMARK_ROOT="${BENCHMARK_ROOT}" \
+    BENCHMARK_RUNTIME_ROOT="${BENCHMARK_RUNTIME_ROOT}" \
     RUN_ROOT="${RUN_ROOT}" \
     RUN_DIR="${RUN_DIR}" \
     PID_FILE="${PID_FILE}" \

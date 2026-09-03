@@ -19,17 +19,17 @@ Candidate counts and distance time should remain stable while bounded sorting ch
 ## Run
 
     WARMUP=500 QUERIES=10000 TOPK=10 \
-      /workspace/benchmark/scripts/run_ivfflat_experiments.sh 2a
+      /workspace/OpenTenBase/benchmark/scripts/run_ivfflat_experiments.sh 2a
 
 Optional smoke matrix:
 
     PHASE2A_PROBES=64 PHASE2A_BOUNDS=0,10 PHASE2A_ROUNDS=1 \
     WARMUP=10 QUERIES=100 \
-      /workspace/benchmark/scripts/run_ivfflat_experiments.sh 2a
+      /workspace/OpenTenBase/benchmark/scripts/run_ivfflat_experiments.sh 2a
 
 The worker builds and installs pgvector with IVFFLAT_BENCH, restarts the server, rebuilds only the GloVe L2 index, and runs serially. Outputs include per-configuration CSVs, phase2a_raw.csv, and phase2a_summary.csv. Rebuild summaries with:
 
-    python3 /workspace/benchmark/scripts/summarize_phase2a.py RUN_DIRECTORY
+    python3 /workspace/OpenTenBase/benchmark/scripts/summarize_phase2a.py RUN_DIRECTORY
 
 ## Correctness and decision criteria
 
