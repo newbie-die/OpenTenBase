@@ -111,6 +111,10 @@ extern int	ivfflat_probes;
 extern int	ivfflat_iterative_scan;
 extern int	ivfflat_max_probes;
 extern int	ivfflat_experimental_sort_bound;
+extern bool ivfflat_bounded_scan;
+extern int	ivfflat_bound_overfetch;
+extern int	ivfflat_bound_min;
+extern int	ivfflat_bound_fastpath_limit;
 
 typedef enum IvfflatIterativeScanMode
 {
@@ -298,6 +302,13 @@ typedef struct IvfflatScanOpaqueData
 	Tuplesortstate *sortstate;
 	int			sortBound;
 	int64		logicalBound;
+	int64		physicalBound;
+	bool		boundedActive;
+	bool		boundedExhausted;
+	bool		fallbackTriggered;
+	ItemPointerData *returnedTids;
+	Size		returnedTidsCount;
+	Size		returnedTidsCapacity;
 	TupleDesc	tupdesc;
 	TupleTableSlot *vslot;
 	TupleTableSlot *mslot;
@@ -319,6 +330,9 @@ typedef struct IvfflatScanOpaqueData
 	double		profile_distance_us;
 	double		profile_sort_us;
 	double		profile_return_us;
+	bool		profile_fallback_triggered;
+	uint64		profile_returned_from_bounded;
+	uint64		profile_returned_after_fallback;
 
 	/* Lists */
 	pairingheap *listQueue;

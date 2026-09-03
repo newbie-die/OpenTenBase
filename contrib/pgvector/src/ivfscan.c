@@ -137,8 +137,8 @@ GetScanItems(IndexScanDesc scan, Datum value)
 
 	tuplesort_reset(so->sortstate);
 	/* tuplesort_reset() clears the per-batch bounded state */
-	if (so->sortBound > 0)
-		tuplesort_set_bound(so->sortstate, so->sortBound);
+	if (so->boundedActive && !so->fallbackTriggered)
+		tuplesort_set_bound(so->sortstate, so->physicalBound);
 
 	/* Search closest probes lists */
 	while (so->listIndex < so->maxProbes && (++batchProbes) <= so->probes)
@@ -294,20 +294,76 @@ GetScanValue(IndexScanDesc scan)
  * Initialize scan sort state
  */
 static Tuplesortstate *
-InitScanSortState(TupleDesc tupdesc, int bound)
+InitScanSortState(TupleDesc tupdesc, bool bounded, int64 bound)
 {
-	AttrNumber	attNums[] = {1};
-	Oid			sortOperators[] = {Float8LessOperator};
-	Oid			sortCollations[] = {InvalidOid};
-	bool		nullsFirstFlags[] = {false};
+	AttrNumber	attNums[] = {1, 2};
+	Oid			sortOperators[] = {Float8LessOperator, TIDLessOperator};
+	Oid			sortCollations[] = {InvalidOid, InvalidOid};
+	bool		nullsFirstFlags[] = {false, false};
 	Tuplesortstate *sortstate;
-	int			sortopt = bound > 0 ? TUPLESORT_ALLOWBOUNDED : TUPLESORT_NONE;
+	int			sortopt = bounded ? TUPLESORT_ALLOWBOUNDED : TUPLESORT_NONE;
 
-	sortstate = tuplesort_begin_heap(tupdesc, 1, attNums, sortOperators, sortCollations, nullsFirstFlags, work_mem, NULL, sortopt);
-	if (bound > 0)
+	sortstate = tuplesort_begin_heap(tupdesc, 2, attNums, sortOperators, sortCollations, nullsFirstFlags, work_mem, NULL, sortopt);
+	if (bounded)
 		tuplesort_set_bound(sortstate, bound);
 
 	return sortstate;
+}
+
+/*
+ * Check whether a TID was already returned during the bounded phase
+ */
+static bool
+ReturnedFromBounded(IvfflatScanOpaque so, ItemPointer heaptid)
+{
+	for (Size i = 0; i < so->returnedTidsCount; i++)
+	{
+		if (ItemPointerEquals(&so->returnedTids[i], heaptid))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Remember a TID returned to the index AM caller during the bounded phase
+ */
+static void
+RememberBoundedTid(IvfflatScanOpaque so, ItemPointer heaptid)
+{
+	if (so->returnedTidsCount == so->returnedTidsCapacity)
+	{
+		Size		newCapacity = so->returnedTidsCapacity == 0 ? 64 :
+			so->returnedTidsCapacity * 2;
+
+		if (so->returnedTids == NULL)
+			so->returnedTids = MemoryContextAlloc(so->tmpCtx,
+											 mul_size(sizeof(ItemPointerData), newCapacity));
+		else
+			so->returnedTids = repalloc_array(so->returnedTids,
+											  ItemPointerData, newCapacity);
+		so->returnedTidsCapacity = newCapacity;
+	}
+
+	ItemPointerCopy(heaptid, &so->returnedTids[so->returnedTidsCount++]);
+}
+
+/*
+ * Rebuild an unbounded sort over the already selected lists
+ */
+static void
+StartFullSortFallback(IndexScanDesc scan)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+
+	so->boundedExhausted = true;
+	so->fallbackTriggered = true;
+	so->profile_fallback_triggered = true;
+
+	tuplesort_end(so->sortstate);
+	so->sortstate = InitScanSortState(so->tupdesc, false, 0);
+	so->listIndex = 0;
+	GetScanItems(scan, so->value);
 }
 
 /*
@@ -348,6 +404,13 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->dimensions = dimensions;
 	so->sortBound = ivfflat_experimental_sort_bound;
 	so->logicalBound = -1;
+	so->physicalBound = 0;
+	so->boundedActive = false;
+	so->boundedExhausted = false;
+	so->fallbackTriggered = false;
+	so->returnedTids = NULL;
+	so->returnedTidsCount = 0;
+	so->returnedTidsCapacity = 0;
 	so->value = PointerGetDatum(NULL);
 
 	/* Set support functions */
@@ -370,7 +433,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 #endif
 
 	/* Prep sort */
-	so->sortstate = InitScanSortState(so->tupdesc, so->sortBound);
+	so->sortstate = NULL;
 
 	/* Need separate slots for puttuple and gettuple */
 	so->vslot = MakeSingleTupleTableSlot(so->tupdesc, &TTSOpsVirtual);
@@ -400,6 +463,9 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->profile_distance_us = 0.0;
 	so->profile_sort_us = 0.0;
 	so->profile_return_us = 0.0;
+	so->profile_fallback_triggered = false;
+	so->profile_returned_from_bounded = 0;
+	so->profile_returned_after_fallback = 0;
 
 	MemoryContextSwitchTo(oldCtx);
 
@@ -417,6 +483,32 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 
 	so->logicalBound = scan->xs_tuple_bound;
+	so->physicalBound = 0;
+	so->boundedActive = false;
+	so->boundedExhausted = false;
+	so->fallbackTriggered = false;
+	so->returnedTidsCount = 0;
+
+	/* Oracle bound has priority over the automatic limit-aware path */
+	if (so->sortBound > 0)
+	{
+		so->physicalBound = so->sortBound;
+		so->boundedActive = true;
+	}
+	else if (ivfflat_bounded_scan &&
+			 so->logicalBound > 0 &&
+			 so->logicalBound <= ivfflat_bound_fastpath_limit &&
+			 ivfflat_iterative_scan == IVFFLAT_ITERATIVE_SCAN_OFF)
+	{
+		so->physicalBound = Max((int64) ivfflat_bound_min,
+								so->logicalBound * ivfflat_bound_overfetch);
+		so->boundedActive = true;
+	}
+
+	if (so->sortstate != NULL)
+		tuplesort_end(so->sortstate);
+	so->sortstate = InitScanSortState(so->tupdesc, so->boundedActive,
+								  so->physicalBound);
 	so->first = true;
 	pairingheap_reset(so->listQueue);
 	so->listIndex = 0;
@@ -496,7 +588,18 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 #ifdef IVFFLAT_BENCH
 		instr_time	start;
 		instr_time	elapsed;
+#endif
 
+		/* Avoid requesting tuple physicalBound + 1 from bounded tuplesort */
+		if (so->boundedActive && !so->fallbackTriggered &&
+			ivfflat_iterative_scan == IVFFLAT_ITERATIVE_SCAN_OFF &&
+			so->returnedTidsCount >= (uint64) so->physicalBound)
+		{
+			StartFullSortFallback(scan);
+			continue;
+		}
+
+#ifdef IVFFLAT_BENCH
 		INSTR_TIME_SET_CURRENT(start);
 #endif
 		found = tuplesort_gettupleslot(so->sortstate, true, false, so->mslot, NULL);
@@ -506,7 +609,28 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 		so->profile_return_us += INSTR_TIME_GET_MICROSEC(elapsed);
 #endif
 		if (found)
+		{
+			heaptid = (ItemPointer) DatumGetPointer(slot_getattr(so->mslot, 2, &isnull));
+
+			/* The full-sort fallback contains the bounded results as well */
+			if (so->fallbackTriggered && ReturnedFromBounded(so, heaptid))
+				continue;
+
 			break;
+		}
+
+		/*
+		 * Exhausting a non-iterative bounded sort while the caller still asks
+		 * for tuples means the conservative bound was insufficient.  Reuse the
+		 * selected listPages, rebuild an unbounded sort, and suppress TIDs that
+		 * were already returned during the bounded phase.
+		 */
+		if (so->boundedActive && !so->fallbackTriggered &&
+			ivfflat_iterative_scan == IVFFLAT_ITERATIVE_SCAN_OFF)
+		{
+			StartFullSortFallback(scan);
+			continue;
+		}
 
 		if (so->listIndex == so->maxProbes)
 			return false;
@@ -514,11 +638,16 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 		GetScanItems(scan, so->value);
 	}
 
-	heaptid = (ItemPointer) DatumGetPointer(slot_getattr(so->mslot, 2, &isnull));
-
 	scan->xs_heaptid = *heaptid;
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
+	if (so->boundedActive && !so->fallbackTriggered)
+	{
+		RememberBoundedTid(so, heaptid);
+		so->profile_returned_from_bounded++;
+	}
+	else if (so->fallbackTriggered)
+		so->profile_returned_after_fallback++;
 	return true;
 }
 
@@ -531,8 +660,13 @@ ivfflatendscan(IndexScanDesc scan)
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 
 #ifdef IVFFLAT_BENCH
-	elog(INFO, "IVFFLAT_PROFILE probes=%d dimensions=%d sort_bound=%d logical_bound=" INT64_FORMAT " candidates=%llu pages=%llu getitems_calls=%llu list_us=%.3f getitems_us=%.3f candidate_us=%.3f distance_us=%.3f sort_us=%.3f return_us=%.3f scan_us=%.3f",
+	elog(INFO, "IVFFLAT_PROFILE probes=%d dimensions=%d sort_bound=%d logical_bound=" INT64_FORMAT " physical_bound=" INT64_FORMAT " bounded_active=%d bounded_exhausted=%d fallback_triggered=%d returned_from_bounded=%llu returned_after_fallback=%llu candidates=%llu pages=%llu getitems_calls=%llu list_us=%.3f getitems_us=%.3f candidate_us=%.3f distance_us=%.3f sort_us=%.3f return_us=%.3f scan_us=%.3f",
 		 so->probes, so->dimensions, so->sortBound, so->logicalBound,
+		 so->physicalBound, so->boundedActive ? 1 : 0,
+		 so->boundedExhausted ? 1 : 0,
+		 so->profile_fallback_triggered ? 1 : 0,
+		 (unsigned long long) so->profile_returned_from_bounded,
+		 (unsigned long long) so->profile_returned_after_fallback,
 		 (unsigned long long) so->profile_candidates,
 		 (unsigned long long) so->profile_pages,
 		 (unsigned long long) so->profile_getitems_calls,

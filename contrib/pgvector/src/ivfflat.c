@@ -25,6 +25,10 @@ int			ivfflat_probes;
 int			ivfflat_iterative_scan;
 int			ivfflat_max_probes;
 int			ivfflat_experimental_sort_bound;
+bool		ivfflat_bounded_scan;
+int			ivfflat_bound_overfetch;
+int			ivfflat_bound_min;
+int			ivfflat_bound_fastpath_limit;
 static relopt_kind ivfflat_relopt_kind;
 
 static const struct config_enum_entry ivfflat_iterative_scan_options[] = {
@@ -60,6 +64,23 @@ IvfflatInit(void)
 							"Zero uses the original full tuplesort. Positive values enable an oracle bounded tuplesort for benchmarking only.",
 							&ivfflat_experimental_sort_bound,
 							0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("ivfflat.bounded_scan", "Enables limit-aware bounded sorting for IVFFlat scans",
+							 "Only non-iterative scans with a small positive executor tuple bound are eligible.",
+							 &ivfflat_bounded_scan,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ivfflat.bound_overfetch", "Sets the overfetch multiplier for limit-aware bounded sorting",
+							 NULL, &ivfflat_bound_overfetch,
+							 4, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ivfflat.bound_min", "Sets the minimum physical bound for limit-aware bounded sorting",
+							 NULL, &ivfflat_bound_min,
+							 40, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ivfflat.bound_fastpath_limit", "Sets the maximum logical bound eligible for limit-aware bounded sorting",
+							 NULL, &ivfflat_bound_fastpath_limit,
+							 100, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("ivfflat");
 }
