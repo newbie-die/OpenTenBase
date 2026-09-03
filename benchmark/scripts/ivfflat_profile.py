@@ -3,7 +3,9 @@
 
 import argparse
 import csv
+import json
 import os
+import random
 import re
 import statistics
 import time
@@ -17,6 +19,19 @@ ROOT = Path(
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE\s+(.*)")
 FIELD_RE = re.compile(r"([a-z_]+)=(-?[0-9.]+)")
 PROBES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+FORMAL_MODES = ("full", "auto")
+FORMAL_RAW_FIELDS = (
+    "experiment", "dataset", "dimension", "metric", "mode", "lists",
+    "probes", "topk", "query_id", "latency_us", "recall_at_10",
+    "returned_rows",
+)
+FORMAL_SUMMARY_FIELDS = (
+    "dataset", "metric", "mode", "lists", "probes", "queries", "topk",
+    "mean_recall_at_10", "p50_ms", "p95_ms", "p99_ms", "mean_ms", "qps",
+    "min_returned_rows", "baseline_p50_ms", "p50_improvement_pct",
+    "baseline_p95_ms", "p95_improvement_pct", "baseline_p99_ms",
+    "p99_improvement_pct", "baseline_qps", "qps_improvement_pct",
+)
 CONFIGS = {
     "glove-l2": {
         "dataset": ROOT / "data/glove100/glove-100-angular.hdf5",
@@ -126,6 +141,27 @@ def write_csv(path, rows):
         writer = csv.DictWriter(output, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_csv_atomic(path, rows, fieldnames):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temporary, path)
+
+
+def write_json_atomic(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w") as output:
+        json.dump(value, output, indent=2, sort_keys=True)
+        output.write("\n")
+    os.replace(temporary, path)
 
 
 def summarize_profile(rows, experiment, name, config, probes):
@@ -379,12 +415,377 @@ def summarize_phase2a34(rows):
     return output
 
 
+def formal_query(cur, sql, query_literal, topk):
+    started = time.perf_counter_ns()
+    cur.execute(sql, (query_literal, topk))
+    ids = [int(row[0]) for row in cur.fetchall()]
+    return ids, (time.perf_counter_ns() - started) / 1000.0
+
+
+def formal_manifest_configuration(args):
+    return {
+        "experiment": "phase_formal",
+        "dataset": "glove100",
+        "dimension": 100,
+        "metric": "cosine",
+        "modes": list(FORMAL_MODES),
+        "lists": args.lists,
+        "probes": list(args.probes_list),
+        "topk": args.topk,
+        "queries": args.queries,
+        "warmup_queries": args.warmup,
+    }
+
+
+def prepare_formal_manifest(path, args):
+    configuration = formal_manifest_configuration(args)
+    if path.exists():
+        with path.open() as source:
+            manifest = json.load(source)
+        if not args.resume:
+            raise RuntimeError(f"formal output already exists; use --resume: {path.parent}")
+        if manifest.get("configuration") != configuration:
+            raise RuntimeError("resume configuration does not match phase_formal_manifest.json")
+        return manifest
+    if args.resume:
+        raise RuntimeError(f"cannot resume without manifest: {path}")
+    manifest = {"configuration": configuration, "ground_truth_verification": None}
+    write_json_atomic(path, manifest)
+    return manifest
+
+
+def formal_checkpoint_path(checkpoint_dir, mode, probes):
+    return checkpoint_dir / f"glove100_cosine_{mode}_p{probes}.csv"
+
+
+def load_formal_checkpoint(path, expected, query_count):
+    if not path.exists():
+        return []
+    with path.open(newline="") as source:
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != FORMAL_RAW_FIELDS:
+            raise RuntimeError(f"unexpected formal checkpoint schema: {path}")
+        parsed = list(reader)
+
+    rows = []
+    seen = set()
+    for position, row in enumerate(parsed):
+        if None in row or any(value is None or value == "" for value in row.values()):
+            if position == len(parsed) - 1:
+                print(f"discard incomplete trailing checkpoint row: {path}", flush=True)
+                continue
+            raise RuntimeError(f"invalid checkpoint row in {path}")
+        query_id = int(row["query_id"])
+        if query_id < 0 or query_id >= query_count:
+            raise RuntimeError(f"query_id out of range in {path}: {query_id}")
+        if query_id in seen:
+            raise RuntimeError(f"duplicate query_id in {path}: {query_id}")
+        for key, value in expected.items():
+            if str(row[key]) != str(value):
+                raise RuntimeError(f"checkpoint config mismatch in {path}: {key}")
+        float(row["latency_us"])
+        float(row["recall_at_10"])
+        int(row["returned_rows"])
+        seen.add(query_id)
+        rows.append(row)
+    return rows
+
+
+def append_formal_checkpoint(path, row):
+    with path.open("a", newline="") as output:
+        csv.DictWriter(output, fieldnames=FORMAL_RAW_FIELDS).writerow(row)
+
+
+def configure_formal_scan(cur, probes, mode):
+    bounded_scan = "on" if mode == "auto" else "off"
+    cur.execute("SET enable_indexscan = on")
+    cur.execute("SET enable_seqscan = off")
+    cur.execute("SET ivfflat.iterative_scan = off")
+    cur.execute("SELECT set_config(%s, %s, false)", ("ivfflat.probes", str(probes)))
+    cur.execute("SELECT set_config(%s, %s, false)",
+                ("ivfflat.experimental_sort_bound", "0"))
+    cur.execute("SELECT set_config(%s, %s, false)",
+                ("ivfflat.bounded_scan", bounded_scan))
+    cur.execute("SELECT set_config(%s, %s, false)", ("ivfflat.bound_overfetch", "4"))
+    cur.execute("SELECT set_config(%s, %s, false)", ("ivfflat.bound_min", "40"))
+    cur.execute("SELECT set_config(%s, %s, false)",
+                ("ivfflat.bound_fastpath_limit", "100"))
+
+    expected = {
+        "ivfflat.probes": str(probes),
+        "ivfflat.iterative_scan": "off",
+        "ivfflat.experimental_sort_bound": "0",
+        "ivfflat.bounded_scan": bounded_scan,
+    }
+    actual = {}
+    for setting, expected_value in expected.items():
+        cur.execute(f"SHOW {setting}")
+        actual[setting] = cur.fetchone()[0]
+        if actual[setting] != expected_value:
+            raise RuntimeError(
+                f"GUC verification failed for {setting}: "
+                f"expected {expected_value}, got {actual[setting]}"
+            )
+    print(f"formal GUC mode={mode} probes={probes} values={actual}", flush=True)
+
+
+def run_formal_config(conn, args, config, query_literals, neighbors,
+                      checkpoint_dir, probes, mode):
+    expected = {
+        "experiment": "phase_formal",
+        "dataset": "glove100",
+        "dimension": config["dimension"],
+        "metric": config["metric"],
+        "mode": mode,
+        "lists": args.lists,
+        "probes": probes,
+        "topk": args.topk,
+    }
+    checkpoint = formal_checkpoint_path(checkpoint_dir, mode, probes)
+    if checkpoint.exists() and not args.resume:
+        raise RuntimeError(f"formal checkpoint already exists; use --resume: {checkpoint}")
+    existing = load_formal_checkpoint(checkpoint, expected, args.queries)
+    write_csv_atomic(checkpoint, sorted(existing, key=lambda row: int(row["query_id"])),
+                     FORMAL_RAW_FIELDS)
+    completed = {int(row["query_id"]) for row in existing}
+    if len(completed) == args.queries:
+        print(f"formal skip complete mode={mode} probes={probes}", flush=True)
+        return
+
+    print(f"formal run mode={mode} probes={probes} "
+          f"remaining={args.queries - len(completed)}", flush=True)
+    sql = (f"SELECT id FROM {config['table']} "
+           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
+    with conn.cursor() as cur:
+        ensure_index(cur, config)
+        configure_formal_scan(cur, probes, mode)
+        for query_literal in query_literals[:args.warmup]:
+            formal_query(cur, sql, query_literal, args.topk)
+        for query_id in range(args.queries):
+            if query_id in completed:
+                continue
+            ids, latency_us = formal_query(
+                cur, sql, query_literals[query_id], args.topk)
+            ground_truth = {int(value) for value in neighbors[query_id]}
+            row = {
+                **expected,
+                "query_id": query_id,
+                "latency_us": latency_us,
+                "recall_at_10": len(ground_truth.intersection(ids)) / args.topk,
+                "returned_rows": len(ids),
+            }
+            append_formal_checkpoint(checkpoint, row)
+            existing.append(row)
+
+    write_csv_atomic(checkpoint, sorted(existing, key=lambda row: int(row["query_id"])),
+                     FORMAL_RAW_FIELDS)
+
+
+def formal_group_stats(rows):
+    latencies_us = [float(row["latency_us"]) for row in rows]
+    total_seconds = sum(latencies_us) / 1_000_000.0
+    return {
+        "mean_recall_at_10": statistics.fmean(
+            float(row["recall_at_10"]) for row in rows),
+        "p50_ms": percentile(latencies_us, 50) / 1000.0,
+        "p95_ms": percentile(latencies_us, 95) / 1000.0,
+        "p99_ms": percentile(latencies_us, 99) / 1000.0,
+        "mean_ms": statistics.fmean(latencies_us) / 1000.0,
+        "qps": len(rows) / total_seconds if total_seconds else 0.0,
+        "min_returned_rows": min(int(row["returned_rows"]) for row in rows),
+    }
+
+
+def summarize_formal(rows):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault((int(row["probes"]), row["mode"]), []).append(row)
+
+    output = []
+    for probes in sorted({key[0] for key in grouped}):
+        full_rows = grouped.get((probes, "full"))
+        if not full_rows:
+            continue
+        baseline = formal_group_stats(full_rows)
+        for mode in FORMAL_MODES:
+            group = grouped.get((probes, mode))
+            if not group:
+                continue
+            values = formal_group_stats(group)
+            output.append({
+                "dataset": group[0]["dataset"],
+                "metric": group[0]["metric"],
+                "mode": mode,
+                "lists": int(group[0]["lists"]),
+                "probes": probes,
+                "queries": len(group),
+                "topk": int(group[0]["topk"]),
+                **values,
+                "baseline_p50_ms": baseline["p50_ms"],
+                "p50_improvement_pct": (
+                    100 * (baseline["p50_ms"] - values["p50_ms"])
+                    / baseline["p50_ms"] if baseline["p50_ms"] else 0.0),
+                "baseline_p95_ms": baseline["p95_ms"],
+                "p95_improvement_pct": (
+                    100 * (baseline["p95_ms"] - values["p95_ms"])
+                    / baseline["p95_ms"] if baseline["p95_ms"] else 0.0),
+                "baseline_p99_ms": baseline["p99_ms"],
+                "p99_improvement_pct": (
+                    100 * (baseline["p99_ms"] - values["p99_ms"])
+                    / baseline["p99_ms"] if baseline["p99_ms"] else 0.0),
+                "baseline_qps": baseline["qps"],
+                "qps_improvement_pct": (
+                    100 * (values["qps"] - baseline["qps"])
+                    / baseline["qps"] if baseline["qps"] else 0.0),
+            })
+    return output
+
+
+def merge_formal_outputs(args, checkpoint_dir, output_prefix):
+    rows = []
+    seen = set()
+    for probes in args.probes_list:
+        for mode in FORMAL_MODES:
+            expected = {
+                "experiment": "phase_formal", "dataset": "glove100",
+                "dimension": 100, "metric": "cosine", "mode": mode,
+                "lists": args.lists, "probes": probes, "topk": args.topk,
+            }
+            checkpoint = formal_checkpoint_path(checkpoint_dir, mode, probes)
+            config_rows = load_formal_checkpoint(checkpoint, expected, args.queries)
+            if len(config_rows) != args.queries:
+                continue
+            for row in config_rows:
+                key = (row["dataset"], row["metric"], row["mode"],
+                       int(row["probes"]), int(row["query_id"]))
+                if key in seen:
+                    raise RuntimeError(f"duplicate formal key while merging: {key}")
+                seen.add(key)
+                rows.append(row)
+
+    mode_order = {mode: position for position, mode in enumerate(FORMAL_MODES)}
+    rows.sort(key=lambda row: (int(row["probes"]), mode_order[row["mode"]],
+                               int(row["query_id"])))
+    if rows:
+        write_csv_atomic(Path(f"{output_prefix}_raw.csv"), rows, FORMAL_RAW_FIELDS)
+        write_csv_atomic(Path(f"{output_prefix}_summary.csv"),
+                         summarize_formal(rows), FORMAL_SUMMARY_FIELDS)
+    return rows
+
+
+def verify_formal_production_build(conn, args, config, query_literal):
+    sql = (f"SELECT id FROM {config['table']} "
+           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
+    with conn.cursor() as cur:
+        configure_formal_scan(cur, args.probes_list[0], "full")
+        cur.execute("SET client_min_messages = info")
+        conn.notices.clear()
+        try:
+            formal_query(cur, sql, query_literal, args.topk)
+            if any(PROFILE_RE.search(notice) for notice in conn.notices):
+                raise RuntimeError(
+                    "formal phase requires a production build without IVFFLAT_BENCH")
+        finally:
+            conn.notices.clear()
+            cur.execute("RESET client_min_messages")
+    print("formal production-build check: IVFFLAT_BENCH profiling is off", flush=True)
+
+
+def verify_formal_ground_truth(conn, args, config, query_literals, neighbors):
+    sample_count = min(args.ground_truth_queries, args.queries)
+    query_ids = sorted(random.Random(20260903).sample(range(args.queries), sample_count))
+    sql = (f"SELECT id FROM {config['table']} "
+           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
+    recalls = []
+    matches = 0
+    with conn.cursor() as cur:
+        cur.execute("SET enable_indexscan = off")
+        cur.execute("SET enable_indexonlyscan = off")
+        cur.execute("SET enable_bitmapscan = off")
+        cur.execute("SET enable_seqscan = on")
+        try:
+            for query_id in query_ids:
+                ids, _ = formal_query(cur, sql, query_literals[query_id], args.topk)
+                ground_truth = {int(value) for value in neighbors[query_id]}
+                recall = len(ground_truth.intersection(ids)) / args.topk
+                recalls.append(recall)
+                matches += int(set(ids) == ground_truth)
+        finally:
+            cur.execute("RESET enable_indexscan")
+            cur.execute("RESET enable_indexonlyscan")
+            cur.execute("RESET enable_bitmapscan")
+            cur.execute("RESET enable_seqscan")
+    result = {
+        "queries": sample_count,
+        "exact_set_matches": matches,
+        "mean_recall_at_10": statistics.fmean(recalls),
+        "query_ids": query_ids,
+    }
+    print(f"formal ground-truth verification: {result}", flush=True)
+    if matches != sample_count:
+        raise RuntimeError("ANN-Benchmarks ground truth differs from PostgreSQL exact Top-10")
+    return result
+
+
+def run_formal(conn, args):
+    if args.queries <= 0:
+        raise ValueError("--queries must be positive")
+    if args.warmup < 0:
+        raise ValueError("--warmup-queries must not be negative")
+    if args.ground_truth_queries <= 0:
+        raise ValueError("--ground-truth-queries must be positive")
+    if args.lists != 1000 or args.topk != 10:
+        raise ValueError("formal phase requires lists=1000 and topk=10")
+    if len(set(args.probes_list)) != len(args.probes_list):
+        raise ValueError("--probes-list must not contain duplicates")
+    if any(probes <= 0 or probes > args.lists for probes in args.probes_list):
+        raise ValueError("formal probes must be between 1 and lists")
+
+    config = CONFIGS["glove-cosine"]
+    load_count = max(args.queries, args.warmup)
+    queries, neighbors = load_workload(config, load_count, args.topk, True)
+    if len(queries) != load_count or len(neighbors) != load_count:
+        raise RuntimeError(
+            f"dataset contains fewer than requested {load_count} query vectors")
+    query_literals = [vector_literal(query) for query in queries]
+
+    verify_formal_production_build(conn, args, config, query_literals[0])
+    output_prefix = Path(args.output or ROOT / "results/phase_formal")
+    checkpoint_dir = output_prefix.parent / f".{output_prefix.name}_checkpoints"
+    manifest_path = output_prefix.parent / f"{output_prefix.name}_manifest.json"
+    manifest = prepare_formal_manifest(manifest_path, args)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.verify_ground_truth:
+        verification = verify_formal_ground_truth(
+            conn, args, config, query_literals, neighbors)
+        manifest["ground_truth_verification"] = verification
+        write_json_atomic(manifest_path, manifest)
+
+    for probes in args.probes_list:
+        for mode in FORMAL_MODES:
+            run_formal_config(conn, args, config, query_literals, neighbors,
+                              checkpoint_dir, probes, mode)
+            merge_formal_outputs(args, checkpoint_dir, output_prefix)
+
+    rows = merge_formal_outputs(args, checkpoint_dir, output_prefix)
+    expected_rows = len(args.probes_list) * len(FORMAL_MODES) * args.queries
+    if len(rows) != expected_rows:
+        raise RuntimeError(
+            f"formal merge incomplete: expected {expected_rows}, got {len(rows)}")
+    print(f"formal complete configs={len(args.probes_list) * len(FORMAL_MODES)} "
+          f"queries_per_config={args.queries} rows={len(rows)}", flush=True)
+
+
 def run_experiment(args):
     conn = connect(args)
     conn.autocommit = True
-    with conn.cursor() as cur:
-        cur.execute("SET client_min_messages = info")
-    if args.phase == "2a34":
+    if args.phase != "formal":
+        with conn.cursor() as cur:
+            cur.execute("SET client_min_messages = info")
+    if args.phase == "formal":
+        run_formal(conn, args)
+    elif args.phase == "2a34":
         config = CONFIGS["glove-cosine"]
         queries, _ = load_workload(config, args.queries, args.topk, False)
         rows = []
@@ -492,8 +893,8 @@ def main():
     build.add_argument("--lists", type=int, default=1000)
     build.add_argument("--output", type=Path)
     run = commands.add_parser("run")
-    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34"), required=True)
-    run.add_argument("--warmup", type=int, default=100)
+    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "formal"), required=True)
+    run.add_argument("--warmup", "--warmup-queries", dest="warmup", type=int, default=100)
     run.add_argument("--queries", type=int, default=1000)
     run.add_argument("--topk", type=int, default=10)
     run.add_argument("--probes-list", type=parse_int_list, default=(16, 64, 128))
@@ -502,6 +903,9 @@ def main():
     run.add_argument("--rounds", type=int, default=3)
     run.add_argument("--lists", type=int, default=1000)
     run.add_argument("--output", type=Path)
+    run.add_argument("--resume", action="store_true")
+    run.add_argument("--verify-ground-truth", action="store_true")
+    run.add_argument("--ground-truth-queries", type=int, default=20)
     args = parser.parse_args()
     if args.command == "build":
         build_indexes(args)

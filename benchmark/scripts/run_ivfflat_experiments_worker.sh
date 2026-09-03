@@ -2,6 +2,20 @@
 set -euo pipefail
 
 PHASE=${1:-all}
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+FORMAL_ARGS=("$@")
+FORMAL_RESUME=0
+for argument in "${FORMAL_ARGS[@]}"; do
+    if [[ "${argument}" == "--resume" ]]; then
+        FORMAL_RESUME=1
+    fi
+done
+if [[ "${PHASE}" != "formal" && ${#FORMAL_ARGS[@]} -gt 0 ]]; then
+    echo "additional CLI options are supported only for phase=formal" >&2
+    exit 2
+fi
 SCRIPT_DIR=$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
     pwd -P
@@ -37,6 +51,9 @@ PHASE2A34_WARMUP=${PHASE2A34_WARMUP:-5}
 PHASE2A34_QUERIES=${PHASE2A34_QUERIES:-20}
 PHASE2A34_PROBES=${PHASE2A34_PROBES:-64}
 PHASE2A34_FILTER_DIVISORS=${PHASE2A34_FILTER_DIVISORS:-1,2,10,100,1000,10000}
+FORMAL_WARMUP=${FORMAL_WARMUP:-100}
+FORMAL_QUERIES=${FORMAL_QUERIES:-10000}
+FORMAL_PROBES=${FORMAL_PROBES:-1,2,4,8,16,32,64,128,256}
 DB_HOST=${DB_HOST:-127.0.0.1}
 DB_PORT=${DB_PORT:-5432}
 DB_NAME=${DB_NAME:-taskdb}
@@ -100,28 +117,50 @@ test -d "${PGDATA}"
     echo "phase2a34_queries=${PHASE2A34_QUERIES}"
     echo "phase2a34_probes=${PHASE2A34_PROBES}"
     echo "phase2a34_filter_divisors=${PHASE2A34_FILTER_DIVISORS}"
+    echo "formal_warmup=${FORMAL_WARMUP}"
+    echo "formal_queries=${FORMAL_QUERIES}"
+    echo "formal_probes=${FORMAL_PROBES}"
+    echo "formal_resume=${FORMAL_RESUME}"
+    printf 'formal_args='
+    printf ' %q' "${FORMAL_ARGS[@]}"
+    printf '\n'
     echo "python=${PYTHON_BIN}"
     "${PG_CONFIG}" --version
     "${PYTHON_BIN}" --version
 } >"${RUN_DIR}/environment.txt"
 
-echo "[$(date -u --iso-8601=seconds)] build pgvector with IVFFLAT_BENCH"
-make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" PG_CFLAGS="-DIVFFLAT_BENCH"
-echo "[$(date -u --iso-8601=seconds)] install pgvector"
-make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}" PG_CFLAGS="-DIVFFLAT_BENCH"
-echo "[$(date -u --iso-8601=seconds)] restart PostgreSQL as ${PG_OS_USER}"
-runuser -u "${PG_OS_USER}" -- "${PG_CTL}" -D "${PGDATA}" restart -m fast -w
+if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
+    echo "[$(date -u --iso-8601=seconds)] resume formal run; keep installed build and index"
+else
+    if [[ "${PHASE}" == "formal" ]]; then
+        echo "[$(date -u --iso-8601=seconds)] build production pgvector without IVFFLAT_BENCH"
+        env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}"
+        echo "[$(date -u --iso-8601=seconds)] install production pgvector"
+        env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}"
+    else
+        echo "[$(date -u --iso-8601=seconds)] build pgvector with IVFFLAT_BENCH"
+        make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" PG_CFLAGS="-DIVFFLAT_BENCH"
+        echo "[$(date -u --iso-8601=seconds)] install pgvector"
+        make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}" PG_CFLAGS="-DIVFFLAT_BENCH"
+    fi
+    echo "[$(date -u --iso-8601=seconds)] restart PostgreSQL as ${PG_OS_USER}"
+    runuser -u "${PG_OS_USER}" -- "${PG_CTL}" -D "${PGDATA}" restart -m fast -w
+fi
 
 COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
 BUILD_DATASET=all
 if [[ "${PHASE}" == "2a" ]]; then
     BUILD_DATASET=glove-l2
-elif [[ "${PHASE}" == "2a2" || "${PHASE}" == "2a34" ]]; then
+elif [[ "${PHASE}" == "2a2" || "${PHASE}" == "2a34" || "${PHASE}" == "formal" ]]; then
     BUILD_DATASET=glove-cosine
 fi
-echo "[$(date -u --iso-8601=seconds)] build indexes dataset=${BUILD_DATASET}"
-"${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" build \
-    --dataset "${BUILD_DATASET}" --lists "${LISTS}" --output "${RUN_DIR}/index_build.csv"
+if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
+    echo "[$(date -u --iso-8601=seconds)] resume formal run; skip index rebuild"
+else
+    echo "[$(date -u --iso-8601=seconds)] build indexes dataset=${BUILD_DATASET}"
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" build \
+        --dataset "${BUILD_DATASET}" --lists "${LISTS}" --output "${RUN_DIR}/index_build.csv"
+fi
 
 run_phase() {
     local phase=$1
@@ -147,6 +186,12 @@ if [[ "${PHASE}" == "2a34" ]]; then
         --phase 2a34 --warmup "${PHASE2A34_WARMUP}" --queries "${PHASE2A34_QUERIES}" --topk "${TOPK}" \
         --probes-list "${PHASE2A34_PROBES}" --filter-divisors "${PHASE2A34_FILTER_DIVISORS}" --lists "${LISTS}" \
         --output "${RUN_DIR}/phase_2a34_robustness"
+fi
+if [[ "${PHASE}" == "formal" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run \
+        --phase formal --warmup-queries "${FORMAL_WARMUP}" --queries "${FORMAL_QUERIES}" \
+        --topk "${TOPK}" --probes-list "${FORMAL_PROBES}" --lists "${LISTS}" \
+        --output "${RUN_DIR}/phase_formal" "${FORMAL_ARGS[@]}"
 fi
 if [[ "${PHASE}" == "all" || "${PHASE}" == "a" ]]; then run_phase a; fi
 if [[ "${PHASE}" == "all" || "${PHASE}" == "b" ]]; then run_phase b; fi

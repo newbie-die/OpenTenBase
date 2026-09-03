@@ -13,9 +13,33 @@ RUN_ROOT=${RUN_ROOT:-"${BENCHMARK_RUNTIME_ROOT}/runs"}
 WORKER=${WORKER:-"${BENCHMARK_ROOT}/scripts/run_ivfflat_experiments_worker.sh"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 PHASE=${1:-all}
+if [[ $# -gt 0 ]]; then
+    shift
+fi
 
-if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" ]]; then
-    echo "usage: $0 [all|a|b|2a|2a2|2a34]" >&2
+if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "formal" ]]; then
+    echo "usage: $0 [all|a|b|2a|2a2|2a34|formal] [formal options]" >&2
+    exit 2
+fi
+
+RESUME_RUN_DIR=
+WORKER_ARGS=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--resume" ]]; then
+        if [[ "${PHASE}" != "formal" || $# -lt 2 ]]; then
+            echo "--resume requires: formal --resume RUN_DIR" >&2
+            exit 2
+        fi
+        RESUME_RUN_DIR=$2
+        WORKER_ARGS+=(--resume)
+        shift 2
+    else
+        WORKER_ARGS+=("$1")
+        shift
+    fi
+done
+if [[ "${PHASE}" != "formal" && ${#WORKER_ARGS[@]} -gt 0 ]]; then
+    echo "additional CLI options are supported only for phase=formal" >&2
     exit 2
 fi
 
@@ -29,10 +53,18 @@ if [[ -s "${PID_FILE}" ]]; then
     fi
 fi
 
-RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
-RUN_DIR="${RUN_ROOT}/${RUN_ID}"
+if [[ -n "${RESUME_RUN_DIR}" ]]; then
+    if [[ ! -d "${RESUME_RUN_DIR}" ]]; then
+        echo "resume run directory does not exist: ${RESUME_RUN_DIR}" >&2
+        exit 2
+    fi
+    RUN_DIR=$(cd -- "${RESUME_RUN_DIR}" && pwd -P)
+else
+    RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
+    RUN_DIR="${RUN_ROOT}/${RUN_ID}"
+    mkdir -p "${RUN_DIR}"
+fi
 LOG_FILE="${RUN_DIR}/experiment.log"
-mkdir -p "${RUN_DIR}"
 
 nohup env \
     BENCHMARK_ROOT="${BENCHMARK_ROOT}" \
@@ -41,8 +73,8 @@ nohup env \
     RUN_DIR="${RUN_DIR}" \
     PID_FILE="${PID_FILE}" \
     PYTHON_BIN="${PYTHON_BIN}" \
-    "${WORKER}" "${PHASE}" \
-    >"${LOG_FILE}" 2>&1 </dev/null &
+    "${WORKER}" "${PHASE}" "${WORKER_ARGS[@]}" \
+    >>"${LOG_FILE}" 2>&1 </dev/null &
 
 WORKER_PID=$!
 echo "${WORKER_PID}" >"${PID_FILE}"
