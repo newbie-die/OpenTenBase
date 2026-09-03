@@ -23,6 +23,13 @@ PHASE2A_QUERIES=${PHASE2A_QUERIES:-10000}
 PHASE2A_PROBES=${PHASE2A_PROBES:-16,64,128}
 PHASE2A_BOUNDS=${PHASE2A_BOUNDS:-0,10,20,40,100}
 PHASE2A_ROUNDS=${PHASE2A_ROUNDS:-3}
+PHASE2A2_WARMUP=${PHASE2A2_WARMUP:-500}
+PHASE2A2_QUERIES=${PHASE2A2_QUERIES:-10000}
+PHASE2A2_PROBES=${PHASE2A2_PROBES:-16,64,128}
+PHASE2A34_WARMUP=${PHASE2A34_WARMUP:-5}
+PHASE2A34_QUERIES=${PHASE2A34_QUERIES:-20}
+PHASE2A34_PROBES=${PHASE2A34_PROBES:-64}
+PHASE2A34_FILTER_DIVISORS=${PHASE2A34_FILTER_DIVISORS:-1,2,10,100,1000,10000}
 DB_HOST=${DB_HOST:-127.0.0.1}
 DB_PORT=${DB_PORT:-5432}
 DB_NAME=${DB_NAME:-taskdb}
@@ -77,6 +84,13 @@ test -d "${PGDATA}"
     echo "phase2a_probes=${PHASE2A_PROBES}"
     echo "phase2a_bounds=${PHASE2A_BOUNDS}"
     echo "phase2a_rounds=${PHASE2A_ROUNDS}"
+    echo "phase2a2_warmup=${PHASE2A2_WARMUP}"
+    echo "phase2a2_queries=${PHASE2A2_QUERIES}"
+    echo "phase2a2_probes=${PHASE2A2_PROBES}"
+    echo "phase2a34_warmup=${PHASE2A34_WARMUP}"
+    echo "phase2a34_queries=${PHASE2A34_QUERIES}"
+    echo "phase2a34_probes=${PHASE2A34_PROBES}"
+    echo "phase2a34_filter_divisors=${PHASE2A34_FILTER_DIVISORS}"
     echo "python=${PYTHON_BIN}"
     "${PG_CONFIG}" --version
     "${PYTHON_BIN}" --version
@@ -93,6 +107,8 @@ COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --use
 BUILD_DATASET=all
 if [[ "${PHASE}" == "2a" ]]; then
     BUILD_DATASET=glove-l2
+elif [[ "${PHASE}" == "2a2" || "${PHASE}" == "2a34" ]]; then
+    BUILD_DATASET=glove-cosine
 fi
 echo "[$(date -u --iso-8601=seconds)] build indexes dataset=${BUILD_DATASET}"
 "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" build \
@@ -110,6 +126,18 @@ if [[ "${PHASE}" == "2a" ]]; then
         --phase 2a --warmup "${PHASE2A_WARMUP}" --queries "${PHASE2A_QUERIES}" --topk "${TOPK}" \
         --probes-list "${PHASE2A_PROBES}" --sort-bounds "${PHASE2A_BOUNDS}" \
         --rounds "${PHASE2A_ROUNDS}" --lists "${LISTS}" --output "${RUN_DIR}/phase2a"
+fi
+if [[ "${PHASE}" == "2a2" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" --host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}" run \
+        --phase 2a2 --warmup "${PHASE2A2_WARMUP}" --queries "${PHASE2A2_QUERIES}" --topk "${TOPK}" \
+        --probes-list "${PHASE2A2_PROBES}" --lists "${LISTS}" \
+        --output "${RUN_DIR}/phase_2a2_profile"
+fi
+if [[ "${PHASE}" == "2a34" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" --host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}" run \
+        --phase 2a34 --warmup "${PHASE2A34_WARMUP}" --queries "${PHASE2A34_QUERIES}" --topk "${TOPK}" \
+        --probes-list "${PHASE2A34_PROBES}" --filter-divisors "${PHASE2A34_FILTER_DIVISORS}" --lists "${LISTS}" \
+        --output "${RUN_DIR}/phase_2a34_robustness"
 fi
 if [[ "${PHASE}" == "all" || "${PHASE}" == "a" ]]; then run_phase a; fi
 if [[ "${PHASE}" == "all" || "${PHASE}" == "b" ]]; then run_phase b; fi

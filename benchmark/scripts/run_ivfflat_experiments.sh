@@ -7,8 +7,8 @@ WORKER=${WORKER:-"${BENCHMARK_ROOT}/scripts/run_ivfflat_experiments_worker.sh"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 PHASE=${1:-all}
 
-if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" ]]; then
-    echo "usage: $0 [all|a|b|2a]" >&2
+if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" ]]; then
+    echo "usage: $0 [all|a|b|2a|2a2|2a34]" >&2
     exit 2
 fi
 
