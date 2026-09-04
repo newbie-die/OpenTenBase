@@ -20,6 +20,10 @@ PROFILE_RE = re.compile(r"IVFFLAT_PROFILE\s+(.*)")
 FIELD_RE = re.compile(r"([a-z_]+)=(-?[0-9.]+)")
 PROBES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 FORMAL_MODES = ("full", "auto")
+FORMAL_DATASET_LABELS = {
+    "glove-cosine": "glove100",
+    "gist-l2": "gist1m",
+}
 FORMAL_RAW_FIELDS = (
     "experiment", "dataset", "dimension", "metric", "mode", "lists",
     "probes", "topk", "query_id", "latency_us", "recall_at_10",
@@ -423,11 +427,12 @@ def formal_query(cur, sql, query_literal, topk):
 
 
 def formal_manifest_configuration(args):
+    config = CONFIGS[args.dataset]
     return {
         "experiment": "phase_formal",
-        "dataset": "glove100",
-        "dimension": 100,
-        "metric": "cosine",
+        "dataset": FORMAL_DATASET_LABELS[args.dataset],
+        "dimension": config["dimension"],
+        "metric": config["metric"],
         "modes": list(FORMAL_MODES),
         "lists": args.lists,
         "probes": list(args.probes_list),
@@ -454,8 +459,8 @@ def prepare_formal_manifest(path, args):
     return manifest
 
 
-def formal_checkpoint_path(checkpoint_dir, mode, probes):
-    return checkpoint_dir / f"glove100_cosine_{mode}_p{probes}.csv"
+def formal_checkpoint_path(checkpoint_dir, dataset, metric, mode, probes):
+    return checkpoint_dir / f"{dataset}_{metric}_{mode}_p{probes}.csv"
 
 
 def load_formal_checkpoint(path, expected, query_count):
@@ -531,9 +536,10 @@ def configure_formal_scan(cur, probes, mode):
 
 def run_formal_config(conn, args, config, query_literals, neighbors,
                       checkpoint_dir, probes, mode):
+    dataset_name = FORMAL_DATASET_LABELS[args.dataset]
     expected = {
         "experiment": "phase_formal",
-        "dataset": "glove100",
+        "dataset": dataset_name,
         "dimension": config["dimension"],
         "metric": config["metric"],
         "mode": mode,
@@ -541,7 +547,8 @@ def run_formal_config(conn, args, config, query_literals, neighbors,
         "probes": probes,
         "topk": args.topk,
     }
-    checkpoint = formal_checkpoint_path(checkpoint_dir, mode, probes)
+    checkpoint = formal_checkpoint_path(
+        checkpoint_dir, dataset_name, config["metric"], mode, probes)
     if checkpoint.exists() and not args.resume:
         raise RuntimeError(f"formal checkpoint already exists; use --resume: {checkpoint}")
     existing = load_formal_checkpoint(checkpoint, expected, args.queries)
@@ -642,16 +649,20 @@ def summarize_formal(rows):
 
 
 def merge_formal_outputs(args, checkpoint_dir, output_prefix):
+    config = CONFIGS[args.dataset]
+    dataset_name = FORMAL_DATASET_LABELS[args.dataset]
     rows = []
     seen = set()
     for probes in args.probes_list:
         for mode in FORMAL_MODES:
             expected = {
-                "experiment": "phase_formal", "dataset": "glove100",
-                "dimension": 100, "metric": "cosine", "mode": mode,
+                "experiment": "phase_formal", "dataset": dataset_name,
+                "dimension": config["dimension"], "metric": config["metric"],
+                "mode": mode,
                 "lists": args.lists, "probes": probes, "topk": args.topk,
             }
-            checkpoint = formal_checkpoint_path(checkpoint_dir, mode, probes)
+            checkpoint = formal_checkpoint_path(
+                checkpoint_dir, dataset_name, config["metric"], mode, probes)
             config_rows = load_formal_checkpoint(checkpoint, expected, args.queries)
             if len(config_rows) != args.queries:
                 continue
@@ -741,7 +752,7 @@ def run_formal(conn, args):
     if any(probes <= 0 or probes > args.lists for probes in args.probes_list):
         raise ValueError("formal probes must be between 1 and lists")
 
-    config = CONFIGS["glove-cosine"]
+    config = CONFIGS[args.dataset]
     load_count = max(args.queries, args.warmup)
     queries, neighbors = load_workload(config, load_count, args.topk, True)
     if len(queries) != load_count or len(neighbors) != load_count:
@@ -894,6 +905,7 @@ def main():
     build.add_argument("--output", type=Path)
     run = commands.add_parser("run")
     run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "formal"), required=True)
+    run.add_argument("--dataset", choices=tuple(FORMAL_DATASET_LABELS), default="glove-cosine")
     run.add_argument("--warmup", "--warmup-queries", dest="warmup", type=int, default=100)
     run.add_argument("--queries", type=int, default=1000)
     run.add_argument("--topk", type=int, default=10)

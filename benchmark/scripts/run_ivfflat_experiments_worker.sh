@@ -54,6 +54,24 @@ PHASE2A34_FILTER_DIVISORS=${PHASE2A34_FILTER_DIVISORS:-1,2,10,100,1000,10000}
 FORMAL_WARMUP=${FORMAL_WARMUP:-100}
 FORMAL_QUERIES=${FORMAL_QUERIES:-10000}
 FORMAL_PROBES=${FORMAL_PROBES:-1,2,4,8,16,32,64,128,256}
+FORMAL_DATASET=${FORMAL_DATASET:-glove-cosine}
+for formal_arg_index in "${!FORMAL_ARGS[@]}"; do
+    argument=${FORMAL_ARGS[formal_arg_index]}
+    if [[ "${argument}" == "--dataset" ]]; then
+        formal_dataset_index=$((formal_arg_index + 1))
+        if [[ ${formal_dataset_index} -ge ${#FORMAL_ARGS[@]} ]]; then
+            echo "--dataset requires a value" >&2
+            exit 2
+        fi
+        FORMAL_DATASET=${FORMAL_ARGS[formal_dataset_index]}
+    elif [[ "${argument}" == --dataset=* ]]; then
+        FORMAL_DATASET=${argument#--dataset=}
+    fi
+done
+if [[ "${FORMAL_DATASET}" != "glove-cosine" && "${FORMAL_DATASET}" != "gist-l2" ]]; then
+    echo "formal dataset must be glove-cosine or gist-l2" >&2
+    exit 2
+fi
 DB_HOST=${DB_HOST:-127.0.0.1}
 DB_PORT=${DB_PORT:-5432}
 DB_NAME=${DB_NAME:-taskdb}
@@ -120,6 +138,7 @@ test -d "${PGDATA}"
     echo "formal_warmup=${FORMAL_WARMUP}"
     echo "formal_queries=${FORMAL_QUERIES}"
     echo "formal_probes=${FORMAL_PROBES}"
+    echo "formal_dataset=${FORMAL_DATASET}"
     echo "formal_resume=${FORMAL_RESUME}"
     printf 'formal_args='
     printf ' %q' "${FORMAL_ARGS[@]}"
@@ -151,8 +170,10 @@ COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --use
 BUILD_DATASET=all
 if [[ "${PHASE}" == "2a" ]]; then
     BUILD_DATASET=glove-l2
-elif [[ "${PHASE}" == "2a2" || "${PHASE}" == "2a34" || "${PHASE}" == "formal" ]]; then
+elif [[ "${PHASE}" == "2a2" || "${PHASE}" == "2a34" ]]; then
     BUILD_DATASET=glove-cosine
+elif [[ "${PHASE}" == "formal" ]]; then
+    BUILD_DATASET=${FORMAL_DATASET}
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; skip index rebuild"
@@ -189,7 +210,8 @@ if [[ "${PHASE}" == "2a34" ]]; then
 fi
 if [[ "${PHASE}" == "formal" ]]; then
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run \
-        --phase formal --warmup-queries "${FORMAL_WARMUP}" --queries "${FORMAL_QUERIES}" \
+        --phase formal --dataset "${FORMAL_DATASET}" \
+        --warmup-queries "${FORMAL_WARMUP}" --queries "${FORMAL_QUERIES}" \
         --topk "${TOPK}" --probes-list "${FORMAL_PROBES}" --lists "${LISTS}" \
         --output "${RUN_DIR}/phase_formal" "${FORMAL_ARGS[@]}"
 fi
