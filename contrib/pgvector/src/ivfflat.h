@@ -333,6 +333,13 @@ typedef struct IvfflatScanOpaqueData
 	bool		profile_fallback_triggered;
 	uint64		profile_returned_from_bounded;
 	uint64		profile_returned_after_fallback;
+#ifdef IVFFLAT_PROFILE_2B
+	uint64 profile_distance_calls, profile_candidate_extract_ns;
+	uint64 profile_distance_ns, profile_tuple_materialization_ns;
+	uint64 profile_sort_insert_ns, profile_sort_finalize_ns;
+	uint64 profile_scan_items_total_ns;
+	uint64 profile_page_candidates[5], profile_max_candidates_per_page;
+#endif
 
 	/* Lists */
 	pairingheap *listQueue;

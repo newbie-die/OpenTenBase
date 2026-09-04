@@ -160,23 +160,40 @@ GetScanItems(IndexScanDesc scan, Datum value)
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			maxoffno = PageGetMaxOffsetNumber(page);
+#ifdef IVFFLAT_PROFILE_2B
+			so->profile_page_candidates[Min((uint64) maxoffno, 4)]++;
+			so->profile_max_candidates_per_page = Max(so->profile_max_candidates_per_page, (uint64) maxoffno);
+#endif
 
 			for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
 			{
 				IndexTuple	itup;
 				Datum		datum;
 				bool		isnull;
-				ItemId		itemid = PageGetItemId(page, offno);
+				ItemId		itemid;
 #ifdef IVFFLAT_BENCH
 				instr_time	candidate_start;
 				instr_time	distance_start;
 				instr_time	elapsed;
-
+#endif
+#ifdef IVFFLAT_PROFILE_2B
+				instr_time	segment_start;
+#endif
+#ifdef IVFFLAT_BENCH
 				INSTR_TIME_SET_CURRENT(candidate_start);
 #endif
+#ifdef IVFFLAT_PROFILE_2B
+				INSTR_TIME_SET_CURRENT(segment_start);
+#endif
+				itemid = PageGetItemId(page, offno);
 
 				itup = (IndexTuple) PageGetItem(page, itemid);
 				datum = index_getattr(itup, 1, tupdesc, &isnull);
+#ifdef IVFFLAT_PROFILE_2B
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, segment_start);
+				so->profile_candidate_extract_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+#endif
 
 				/*
 				 * Add virtual tuple
@@ -184,7 +201,15 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				 * Use procinfo from the index instead of scan key for
 				 * performance
 				 */
+#ifdef IVFFLAT_PROFILE_2B
+				INSTR_TIME_SET_CURRENT(segment_start);
+#endif
 				ExecClearTuple(slot);
+#ifdef IVFFLAT_PROFILE_2B
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, segment_start);
+				so->profile_tuple_materialization_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+#endif
 #ifdef IVFFLAT_BENCH
 				INSTR_TIME_SET_CURRENT(distance_start);
 #endif
@@ -193,13 +218,31 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				INSTR_TIME_SET_CURRENT(elapsed);
 				INSTR_TIME_SUBTRACT(elapsed, distance_start);
 				so->profile_distance_us += INSTR_TIME_GET_MICROSEC(elapsed);
+#ifdef IVFFLAT_PROFILE_2B
+				so->profile_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+				so->profile_distance_calls++;
+#endif
+#endif
+#ifdef IVFFLAT_PROFILE_2B
+				INSTR_TIME_SET_CURRENT(segment_start);
 #endif
 				slot->tts_isnull[0] = false;
 				slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
 				slot->tts_isnull[1] = false;
 				ExecStoreVirtualTuple(slot);
+#ifdef IVFFLAT_PROFILE_2B
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, segment_start);
+				so->profile_tuple_materialization_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+				INSTR_TIME_SET_CURRENT(segment_start);
+#endif
 
 				tuplesort_puttupleslot(so->sortstate, slot);
+#ifdef IVFFLAT_PROFILE_2B
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, segment_start);
+				so->profile_sort_insert_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+#endif
 #ifdef IVFFLAT_BENCH
 				INSTR_TIME_SET_CURRENT(elapsed);
 				INSTR_TIME_SUBTRACT(elapsed, candidate_start);
@@ -224,6 +267,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, sort_start);
 		so->profile_sort_us += INSTR_TIME_GET_MICROSEC(elapsed);
+#ifdef IVFFLAT_PROFILE_2B
+		so->profile_sort_finalize_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+#endif
 	}
 #else
 	tuplesort_performsort(so->sortstate);
@@ -236,6 +282,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, getitems_start);
 		so->profile_getitems_us += INSTR_TIME_GET_MICROSEC(elapsed);
+#ifdef IVFFLAT_PROFILE_2B
+		so->profile_scan_items_total_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+#endif
 	}
 #endif
 
@@ -466,6 +515,13 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->profile_fallback_triggered = false;
 	so->profile_returned_from_bounded = 0;
 	so->profile_returned_after_fallback = 0;
+#ifdef IVFFLAT_PROFILE_2B
+	so->profile_distance_calls = so->profile_candidate_extract_ns = 0;
+	so->profile_distance_ns = so->profile_tuple_materialization_ns = 0;
+	so->profile_sort_insert_ns = so->profile_sort_finalize_ns = 0;
+	so->profile_scan_items_total_ns = so->profile_max_candidates_per_page = 0;
+	MemSet(so->profile_page_candidates, 0, sizeof(so->profile_page_candidates));
+#endif
 
 	MemoryContextSwitchTo(oldCtx);
 
@@ -674,6 +730,17 @@ ivfflatendscan(IndexScanDesc scan)
 		 so->profile_candidate_us, so->profile_distance_us,
 		 so->profile_sort_us, so->profile_return_us,
 		 so->profile_list_us + so->profile_getitems_us + so->profile_return_us);
+#ifdef IVFFLAT_PROFILE_2B
+	elog(INFO, "IVFFLAT_PROFILE_2B probes=%d dimensions=%d scanned_candidates=%llu scanned_pages=%llu distance_calls=%llu candidate_extract_ns=%llu distance_ns=%llu tuple_materialization_ns=%llu sort_insert_ns=%llu sort_finalize_ns=%llu scan_items_total_ns=%llu page_candidates_0=%llu page_candidates_1=%llu page_candidates_2=%llu page_candidates_3=%llu page_candidates_4plus=%llu max_candidates_per_page=%llu",
+		 so->probes, so->dimensions, (unsigned long long) so->profile_candidates, (unsigned long long) so->profile_pages,
+		 (unsigned long long) so->profile_distance_calls, (unsigned long long) so->profile_candidate_extract_ns,
+		 (unsigned long long) so->profile_distance_ns, (unsigned long long) so->profile_tuple_materialization_ns,
+		 (unsigned long long) so->profile_sort_insert_ns, (unsigned long long) so->profile_sort_finalize_ns,
+		 (unsigned long long) so->profile_scan_items_total_ns, (unsigned long long) so->profile_page_candidates[0],
+		 (unsigned long long) so->profile_page_candidates[1], (unsigned long long) so->profile_page_candidates[2],
+		 (unsigned long long) so->profile_page_candidates[3], (unsigned long long) so->profile_page_candidates[4],
+		 (unsigned long long) so->profile_max_candidates_per_page);
+#endif
 #endif
 
 	/* Free any temporary files */
