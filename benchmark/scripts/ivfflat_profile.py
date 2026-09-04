@@ -17,7 +17,8 @@ ROOT = Path(
     os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")
 ).resolve()
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE\s+(.*)")
-FIELD_RE = re.compile(r"([a-z_]+)=(-?[0-9.]+)")
+PROFILE_2B_RE = re.compile(r"IVFFLAT_PROFILE_2B\s+(.*)")
+FIELD_RE = re.compile(r"([a-z0-9_]+)=(-?[0-9.]+)")
 PROBES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 FORMAL_MODES = ("full", "auto")
 FORMAL_DATASET_LABELS = {
@@ -102,6 +103,14 @@ def parse_profile(notices):
                     values[key] = int(values[key])
             return values
     raise RuntimeError("No IVFFLAT_PROFILE notice; build with PG_CFLAGS=-DIVFFLAT_BENCH")
+
+
+def parse_profile_2b(notices):
+    for notice in reversed(notices):
+        match = PROFILE_2B_RE.search(notice)
+        if match:
+            return {key: int(float(value)) for key, value in FIELD_RE.findall(match.group(1))}
+    raise RuntimeError("No IVFFLAT_PROFILE_2B notice; build with IVFFLAT_PROFILE_2B")
 
 
 def ensure_index(cur, config):
@@ -788,6 +797,70 @@ def run_formal(conn, args):
           f"queries_per_config={args.queries} rows={len(rows)}", flush=True)
 
 
+def run_phase2b(conn, args):
+    config = CONFIGS["gist-l2"]
+    queries, _ = load_workload(config, max(args.warmup, args.queries), args.topk)
+    raw_rows = []
+    with conn.cursor() as cur:
+        ensure_index(cur, config)
+        cur.execute("SET enable_seqscan = off")
+        cur.execute("SET ivfflat.iterative_scan = off")
+        cur.execute("SELECT set_config('ivfflat.experimental_sort_bound', '0', false)")
+        cur.execute("SELECT set_config('ivfflat.bounded_scan', %s, false)",
+                    ("on" if args.mode == "auto" else "off",))
+        cur.execute("SELECT set_config('ivfflat.bound_overfetch', '4', false)")
+        cur.execute("SELECT set_config('ivfflat.bound_min', '40', false)")
+        cur.execute("SELECT set_config('ivfflat.bound_fastpath_limit', '100', false)")
+        for probes in args.probes_list:
+            cur.execute("SELECT set_config('ivfflat.probes', %s, false)", (str(probes),))
+            for query in queries[:args.warmup]:
+                execute_query(conn, cur, config, query, args.topk, False)
+            for query_id, query in enumerate(queries[:args.queries]):
+                conn.notices.clear()
+                _, _, profile = execute_query(conn, cur, config, query, args.topk, True)
+                row = parse_profile_2b(conn.notices)
+                row.update(profile)
+                row.update(query_id=query_id, mode=args.mode)
+                raw_rows.append(row)
+    summaries = []
+    for probes in args.probes_list:
+        group = [row for row in raw_rows if row["probes"] == probes]
+        total = lambda key: sum(row[key] for row in group)
+        pages = total("scanned_pages")
+        candidates = total("scanned_candidates")
+        scan_ns = total("scan_items_total_ns")
+        summary = {"mode": args.mode, "probes": probes, "queries": len(group),
+                   "scanned_pages": pages, "scanned_candidates": candidates,
+                   "distance_calls": total("distance_calls"),
+                   "avg_pages_per_query": pages / len(group),
+                   "avg_candidates_per_query": candidates / len(group),
+                   "distance_ns_per_candidate": total("distance_ns") / candidates,
+                   "candidate_extract_ns": total("candidate_extract_ns"),
+                   "distance_ns": total("distance_ns"),
+                   "tuple_materialization_ns": total("tuple_materialization_ns"),
+                   "sort_insert_ns": total("sort_insert_ns"),
+                   "sort_finalize_ns": total("sort_finalize_ns"),
+                   "scan_items_total_ns": scan_ns,
+                   "distance_pct": 100 * total("distance_ns") / scan_ns,
+                   "candidate_extraction_pct": 100 * total("candidate_extract_ns") / scan_ns,
+                   "tuple_materialization_pct": 100 * total("tuple_materialization_ns") / scan_ns,
+                   "sort_insertion_pct": 100 * total("sort_insert_ns") / scan_ns,
+                   "sort_finalize_pct": 100 * total("sort_finalize_ns") / scan_ns,
+                   "average_candidates_per_page": candidates / pages,
+                   "max_candidates_per_page": max(row["max_candidates_per_page"] for row in group)}
+        for bucket in (0, 1, 2, 3):
+            count = total(f"page_candidates_{bucket}")
+            summary[f"page_candidates_{bucket}"] = count
+            summary[f"page_candidates_{bucket}_pct"] = 100 * count / pages
+        count = total("page_candidates_4plus")
+        summary["page_candidates_4plus"] = count
+        summary["page_candidates_4plus_pct"] = 100 * count / pages
+        summaries.append(summary)
+    output = Path(args.output or ROOT / "results/phase_2b_profile")
+    write_csv(Path(f"{output}_raw.csv"), raw_rows)
+    write_csv(Path(f"{output}_summary.csv"), summaries)
+
+
 def run_experiment(args):
     conn = connect(args)
     conn.autocommit = True
@@ -796,6 +869,8 @@ def run_experiment(args):
             cur.execute("SET client_min_messages = info")
     if args.phase == "formal":
         run_formal(conn, args)
+    elif args.phase == "2b":
+        run_phase2b(conn, args)
     elif args.phase == "2a34":
         config = CONFIGS["glove-cosine"]
         queries, _ = load_workload(config, args.queries, args.topk, False)
@@ -904,7 +979,7 @@ def main():
     build.add_argument("--lists", type=int, default=1000)
     build.add_argument("--output", type=Path)
     run = commands.add_parser("run")
-    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "formal"), required=True)
+    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "2b", "formal"), required=True)
     run.add_argument("--dataset", choices=tuple(FORMAL_DATASET_LABELS), default="glove-cosine")
     run.add_argument("--warmup", "--warmup-queries", dest="warmup", type=int, default=100)
     run.add_argument("--queries", type=int, default=1000)
@@ -914,6 +989,7 @@ def main():
     run.add_argument("--sort-bounds", type=parse_int_list, default=(0, 10, 20, 40, 100))
     run.add_argument("--rounds", type=int, default=3)
     run.add_argument("--lists", type=int, default=1000)
+    run.add_argument("--mode", choices=("full", "auto"), default="full")
     run.add_argument("--output", type=Path)
     run.add_argument("--resume", action="store_true")
     run.add_argument("--verify-ground-truth", action="store_true")

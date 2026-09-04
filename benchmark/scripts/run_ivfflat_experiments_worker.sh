@@ -51,6 +51,10 @@ PHASE2A34_WARMUP=${PHASE2A34_WARMUP:-5}
 PHASE2A34_QUERIES=${PHASE2A34_QUERIES:-20}
 PHASE2A34_PROBES=${PHASE2A34_PROBES:-64}
 PHASE2A34_FILTER_DIVISORS=${PHASE2A34_FILTER_DIVISORS:-1,2,10,100,1000,10000}
+PHASE2B_WARMUP=${PHASE2B_WARMUP:-100}
+PHASE2B_QUERIES=${PHASE2B_QUERIES:-100}
+PHASE2B_PROBES=${PHASE2B_PROBES:-16,64,128}
+PHASE2B_MODE=${PHASE2B_MODE:-full}
 FORMAL_WARMUP=${FORMAL_WARMUP:-100}
 FORMAL_QUERIES=${FORMAL_QUERIES:-10000}
 FORMAL_PROBES=${FORMAL_PROBES:-1,2,4,8,16,32,64,128,256}
@@ -148,6 +152,9 @@ test -d "${PGDATA}"
     "${PYTHON_BIN}" --version
 } >"${RUN_DIR}/environment.txt"
 
+if [[ "${PHASE}" == "2b" ]]; then
+    PROFILE_CFLAGS="-DIVFFLAT_BENCH -DIVFFLAT_PROFILE_2B"
+fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; keep installed build and index"
 else
@@ -158,12 +165,19 @@ else
         env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}"
     else
         echo "[$(date -u --iso-8601=seconds)] build pgvector with IVFFLAT_BENCH"
-        make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" PG_CFLAGS="-DIVFFLAT_BENCH"
+        make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}"
         echo "[$(date -u --iso-8601=seconds)] install pgvector"
-        make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}" PG_CFLAGS="-DIVFFLAT_BENCH"
+        make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}"
     fi
     echo "[$(date -u --iso-8601=seconds)] restart PostgreSQL as ${PG_OS_USER}"
-    runuser -u "${PG_OS_USER}" -- "${PG_CTL}" -D "${PGDATA}" restart -m fast -w
+    if [[ "$(id -un)" == "${PG_OS_USER}" ]]; then
+        "${PG_CTL}" -D "${PGDATA}" restart -m fast -w
+    elif [[ "$(id -u)" -eq 0 ]]; then
+        runuser -u "${PG_OS_USER}" -- "${PG_CTL}" -D "${PGDATA}" restart -m fast -w
+    else
+        echo "cannot restart PostgreSQL: current user=$(id -un), required user=${PG_OS_USER}" >&2
+        exit 1
+    fi
 fi
 
 COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
@@ -177,6 +191,8 @@ elif [[ "${PHASE}" == "formal" ]]; then
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; skip index rebuild"
+elif [[ "${PHASE}" == "2b" ]]; then
+    echo "[$(date -u --iso-8601=seconds)] phase 2b reuses existing gist_ivf_l2 index"
 else
     echo "[$(date -u --iso-8601=seconds)] build indexes dataset=${BUILD_DATASET}"
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" build \
@@ -207,6 +223,12 @@ if [[ "${PHASE}" == "2a34" ]]; then
         --phase 2a34 --warmup "${PHASE2A34_WARMUP}" --queries "${PHASE2A34_QUERIES}" --topk "${TOPK}" \
         --probes-list "${PHASE2A34_PROBES}" --filter-divisors "${PHASE2A34_FILTER_DIVISORS}" --lists "${LISTS}" \
         --output "${RUN_DIR}/phase_2a34_robustness"
+fi
+if [[ "${PHASE}" == "2b" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run --phase 2b \
+        --warmup "${PHASE2B_WARMUP}" --queries "${PHASE2B_QUERIES}" --topk "${TOPK}" \
+        --probes-list "${PHASE2B_PROBES}" --mode "${PHASE2B_MODE}" \
+        --output "${RUN_DIR}/phase_2b_profile"
 fi
 if [[ "${PHASE}" == "formal" ]]; then
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run \

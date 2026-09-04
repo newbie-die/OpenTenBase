@@ -17,8 +17,8 @@ if [[ $# -gt 0 ]]; then
     shift
 fi
 
-if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "formal" ]]; then
-    echo "usage: $0 [all|a|b|2a|2a2|2a34|formal] [formal options]" >&2
+if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "2b" && "${PHASE}" != "formal" ]]; then
+    echo "usage: $0 [all|a|b|2a|2a2|2a34|2b|formal] [formal options]" >&2
     exit 2
 fi
 
