@@ -27,6 +27,11 @@ Vector	   *InitVector(int dim);
 void		PrintVector(char *msg, Vector * vector);
 int			vector_cmp_internal(Vector * a, Vector * b);
 float		VectorL2SquaredDistanceRaw(int dim, const float *ax, const float *bx);
+#ifdef IVFFLAT_BENCH
+void		VectorL2SquaredDistancePairRaw(int dim, const float *query,
+									   const float *a, const float *b,
+									   float *distance_a, float *distance_b);
+#endif
 Datum		vector_l2_squared_distance(PG_FUNCTION_ARGS);
 
 /* TODO Move to better place */

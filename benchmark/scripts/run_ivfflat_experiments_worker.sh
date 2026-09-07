@@ -5,16 +5,27 @@ PHASE=${1:-all}
 if [[ $# -gt 0 ]]; then
     shift
 fi
-FORMAL_ARGS=("$@")
+PHASE_ARGS=("$@")
+FORMAL_ARGS=()
+if [[ "${PHASE}" == "formal" ]]; then FORMAL_ARGS=("$@"); fi
 FORMAL_RESUME=0
 for argument in "${FORMAL_ARGS[@]}"; do
     if [[ "${argument}" == "--resume" ]]; then
         FORMAL_RESUME=1
     fi
 done
-if [[ "${PHASE}" != "formal" && ${#FORMAL_ARGS[@]} -gt 0 ]]; then
-    echo "additional CLI options are supported only for phase=formal" >&2
+if [[ "${PHASE}" != "formal" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && ${#PHASE_ARGS[@]} -gt 0 ]]; then
+    echo "additional CLI options are supported only for formal, 2b and 2b-correctness" >&2
     exit 2
+fi
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+    for argument in "${PHASE_ARGS[@]}"; do
+        case "${argument}" in
+            --phase|--phase=*|--output|--output=*|--resume|--validate-only)
+                echo "worker owns phase/output/resume; unsupported option: ${argument}" >&2
+                exit 2 ;;
+        esac
+    done
 fi
 SCRIPT_DIR=$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
@@ -56,6 +67,11 @@ PHASE2B_QUERIES=${PHASE2B_QUERIES:-100}
 PHASE2B_PROBES=${PHASE2B_PROBES:-16,64,128}
 PHASE2B_MODE=${PHASE2B_MODE:-full}
 PHASE2B_DISTANCE_PATH=${PHASE2B_DISTANCE_PATH:-generic}
+PHASE2B_ROUNDS=${PHASE2B_ROUNDS:-2}
+PHASE2B_BASELINE_PATH=${PHASE2B_BASELINE_PATH:-generic}
+PHASE2B_TEST_PATH=${PHASE2B_TEST_PATH:-direct}
+PHASE2B_CHECK_FUSED2_EDGES=${PHASE2B_CHECK_FUSED2_EDGES:-0}
+PHASE2B_OPTFLAGS=${PHASE2B_OPTFLAGS:-"-march=haswell -mtune=haswell -mavx2 -mfma"}
 PHASE2B_CORRECTNESS_WARMUP=${PHASE2B_CORRECTNESS_WARMUP:-100}
 PHASE2B_CORRECTNESS_QUERIES=${PHASE2B_CORRECTNESS_QUERIES:-100}
 PHASE2B_UNSUPPORTED_QUERIES=${PHASE2B_UNSUPPORTED_QUERIES:-10}
@@ -148,6 +164,14 @@ test -d "${PGDATA}"
     echo "phase2b_probes=${PHASE2B_PROBES}"
     echo "phase2b_mode=${PHASE2B_MODE}"
     echo "phase2b_distance_path=${PHASE2B_DISTANCE_PATH}"
+    echo "phase2b_rounds=${PHASE2B_ROUNDS}"
+    echo "phase2b_baseline_path=${PHASE2B_BASELINE_PATH}"
+    echo "phase2b_test_path=${PHASE2B_TEST_PATH}"
+    echo "phase2b_check_fused2_edges=${PHASE2B_CHECK_FUSED2_EDGES}"
+    printf 'phase_args='
+    printf ' %q' "${PHASE_ARGS[@]}"
+    printf '\n'
+    echo "phase2b_optflags=${PHASE2B_OPTFLAGS}"
     echo "phase2b_correctness_warmup=${PHASE2B_CORRECTNESS_WARMUP}"
     echo "phase2b_correctness_queries=${PHASE2B_CORRECTNESS_QUERIES}"
     echo "phase2b_unsupported_queries=${PHASE2B_UNSUPPORTED_QUERIES}"
@@ -164,8 +188,34 @@ test -d "${PGDATA}"
     "${PYTHON_BIN}" --version
 } >"${RUN_DIR}/environment.txt"
 
+COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
+PHASE2B_RUN_ARGS=()
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+    PHASE2B_RUN_ARGS=(--phase "${PHASE}" --baseline-path "${PHASE2B_BASELINE_PATH}"
+                     --test-path "${PHASE2B_TEST_PATH}" --topk "${TOPK}" --lists "${LISTS}")
+    if [[ "${PHASE}" == "2b" ]]; then
+        PHASE2B_RUN_ARGS+=(--warmup "${PHASE2B_WARMUP}" --queries "${PHASE2B_QUERIES}"
+                          --probes-list "${PHASE2B_PROBES}" --mode "${PHASE2B_MODE}"
+                          --distance-path "${PHASE2B_DISTANCE_PATH}" --rounds "${PHASE2B_ROUNDS}"
+                          --output "${RUN_DIR}/phase_2b_profile")
+    else
+        PHASE2B_RUN_ARGS+=(--warmup "${PHASE2B_CORRECTNESS_WARMUP}" --queries "${PHASE2B_CORRECTNESS_QUERIES}"
+                          --probes-list 64 --unsupported-queries "${PHASE2B_UNSUPPORTED_QUERIES}"
+                          --output "${RUN_DIR}/phase_2b_correctness")
+        if [[ "${PHASE2B_CHECK_FUSED2_EDGES}" == "1" ]]; then
+            PHASE2B_RUN_ARGS+=(--check-fused2-edges)
+        fi
+    fi
+    PHASE2B_RUN_ARGS+=("${PHASE_ARGS[@]}")
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${PHASE2B_RUN_ARGS[@]}" --validate-only
+    printf '%q ' "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${PHASE2B_RUN_ARGS[@]}" >"${RUN_DIR}/run-command.txt"
+    printf '\n' >>"${RUN_DIR}/run-command.txt"
+fi
+
+PROFILE_BUILD_ARGS=()
 if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
     PROFILE_CFLAGS="-DIVFFLAT_BENCH -DIVFFLAT_PROFILE_2B"
+    PROFILE_BUILD_ARGS=(OPTFLAGS="${PHASE2B_OPTFLAGS}")
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; keep installed build and index"
@@ -177,9 +227,9 @@ else
         env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}"
     else
         echo "[$(date -u --iso-8601=seconds)] build pgvector with IVFFLAT_BENCH"
-        make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}"
+        env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}" "${PROFILE_BUILD_ARGS[@]}"
         echo "[$(date -u --iso-8601=seconds)] install pgvector"
-        make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}"
+        env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}" "${PROFILE_BUILD_ARGS[@]}"
     fi
     echo "[$(date -u --iso-8601=seconds)] restart PostgreSQL as ${PG_OS_USER}"
     if [[ "$(id -un)" == "${PG_OS_USER}" ]]; then
@@ -192,7 +242,6 @@ else
     fi
 fi
 
-COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
 BUILD_DATASET=all
 if [[ "${PHASE}" == "2a" ]]; then
     BUILD_DATASET=glove-l2
@@ -236,17 +285,8 @@ if [[ "${PHASE}" == "2a34" ]]; then
         --probes-list "${PHASE2A34_PROBES}" --filter-divisors "${PHASE2A34_FILTER_DIVISORS}" --lists "${LISTS}" \
         --output "${RUN_DIR}/phase_2a34_robustness"
 fi
-if [[ "${PHASE}" == "2b" ]]; then
-    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run --phase 2b \
-        --warmup "${PHASE2B_WARMUP}" --queries "${PHASE2B_QUERIES}" --topk "${TOPK}" \
-        --probes-list "${PHASE2B_PROBES}" --mode "${PHASE2B_MODE}" \
-        --distance-path "${PHASE2B_DISTANCE_PATH}" --output "${RUN_DIR}/phase_2b_profile"
-fi
-if [[ "${PHASE}" == "2b-correctness" ]]; then
-    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run --phase 2b-correctness \
-        --warmup "${PHASE2B_CORRECTNESS_WARMUP}" --queries "${PHASE2B_CORRECTNESS_QUERIES}" --topk "${TOPK}" \
-        --probes-list 64 --unsupported-queries "${PHASE2B_UNSUPPORTED_QUERIES}" \
-        --output "${RUN_DIR}/phase_2b_direct_correctness"
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${PHASE2B_RUN_ARGS[@]}"
 fi
 if [[ "${PHASE}" == "formal" ]]; then
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run \

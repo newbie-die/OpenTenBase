@@ -188,6 +188,14 @@ GetScanItems(IndexScanDesc scan, Datum value)
 			Buffer		buf;
 			Page		page;
 			OffsetNumber maxoffno;
+#ifdef IVFFLAT_BENCH
+			/* Only a scalar distance survives to the next offset, never a Vector *. */
+			OffsetNumber pairedOffset = InvalidOffsetNumber;
+			float		pairedDistance = 0.0f;
+#endif
+#ifdef IVFFLAT_PROFILE_2B
+			uint64		pageCandidates = 0;
+#endif
 
 #ifdef IVFFLAT_BENCH
 			so->profile_pages++;
@@ -197,10 +205,6 @@ GetScanItems(IndexScanDesc scan, Datum value)
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			maxoffno = PageGetMaxOffsetNumber(page);
-#ifdef IVFFLAT_PROFILE_2B
-			so->profile_page_candidates[Min((uint64) maxoffno, 4)]++;
-			so->profile_max_candidates_per_page = Max(so->profile_max_candidates_per_page, (uint64) maxoffno);
-#endif
 
 			for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
 			{
@@ -215,6 +219,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #endif
 #ifdef IVFFLAT_PROFILE_2B
 				instr_time	segment_start;
+				bool		fusedDistance = false;
 #endif
 #ifdef IVFFLAT_BENCH
 				INSTR_TIME_SET_CURRENT(candidate_start);
@@ -227,6 +232,8 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				itup = (IndexTuple) PageGetItem(page, itemid);
 				datum = index_getattr(itup, 1, tupdesc, &isnull);
 #ifdef IVFFLAT_PROFILE_2B
+				if (!isnull)
+					pageCandidates++;
 				INSTR_TIME_SET_CURRENT(elapsed);
 				INSTR_TIME_SUBTRACT(elapsed, segment_start);
 				so->profile_candidate_extract_ns += INSTR_TIME_GET_NANOSEC(elapsed);
@@ -251,12 +258,69 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				INSTR_TIME_SET_CURRENT(distance_start);
 #endif
 #ifdef IVFFLAT_BENCH
-				if (so->useDirectL2)
+				if (so->useFused2 && offno == pairedOffset)
 				{
-					slot->tts_values[0] = DirectL2Distance(so, datum);
+					slot->tts_values[0] = Float8GetDatum((double) pairedDistance);
+					pairedOffset = InvalidOffsetNumber;
 #ifdef IVFFLAT_PROFILE_2B
-					so->profile_direct_distance_calls++;
+					fusedDistance = true;
 #endif
+				}
+				else if (so->useDirectL2)
+				{
+					bool		paired = false;
+
+					/* Preserve the existing offset scan and tuplesort input order. */
+					if (so->useFused2 && offno < maxoffno && !isnull &&
+						!VARATT_IS_EXTENDED(DatumGetPointer(datum)))
+					{
+						OffsetNumber nextoff = OffsetNumberNext(offno);
+						ItemId		nextid = PageGetItemId(page, nextoff);
+
+						if (ItemIdIsNormal(nextid))
+						{
+							IndexTuple nexttuple = (IndexTuple) PageGetItem(page, nextid);
+							bool		nextnull;
+							Datum		nextdatum = index_getattr(nexttuple, 1, tupdesc, &nextnull);
+
+							if (!nextnull && !VARATT_IS_EXTENDED(DatumGetPointer(nextdatum)))
+							{
+								Vector	   *a = (Vector *) DatumGetPointer(datum);
+								Vector	   *b = (Vector *) DatumGetPointer(nextdatum);
+
+								/* Unusual representations/dimensions retain DIRECT safety. */
+								if (a->dim == so->directQuery->dim && b->dim == a->dim)
+								{
+									float		distance;
+
+									VectorL2SquaredDistancePairRaw(a->dim, so->directQuery->x,
+																 a->x, b->x, &distance, &pairedDistance);
+									slot->tts_values[0] = Float8GetDatum((double) distance);
+									pairedOffset = nextoff;
+									paired = true;
+#ifdef IVFFLAT_PROFILE_2B
+									fusedDistance = true;
+									so->profile_fused_pair_calls++;
+									so->profile_fused_candidates += 2;
+#endif
+								}
+							}
+						}
+					}
+					if (!paired)
+					{
+						slot->tts_values[0] = DirectL2Distance(so, datum);
+#ifdef IVFFLAT_PROFILE_2B
+						so->profile_direct_distance_calls++;
+						if (so->useFused2)
+						{
+							if (offno == maxoffno)
+								so->profile_single_tail_candidates++;
+							else
+								so->profile_fused_fallback_candidates++;
+						}
+#endif
+					}
 				}
 				else
 #endif
@@ -272,7 +336,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				so->profile_distance_us += INSTR_TIME_GET_MICROSEC(elapsed);
 #ifdef IVFFLAT_PROFILE_2B
 				so->profile_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
-				if (so->useDirectL2)
+				if (fusedDistance)
+					so->profile_fused_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+				else if (so->useDirectL2)
 					so->profile_direct_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
 				else
 					so->profile_generic_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
@@ -308,6 +374,13 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #endif
 			}
 
+#ifdef IVFFLAT_BENCH
+			Assert(pairedOffset == InvalidOffsetNumber);
+#endif
+#ifdef IVFFLAT_PROFILE_2B
+			so->profile_page_candidates[Min(pageCandidates, 4)]++;
+			so->profile_max_candidates_per_page = Max(so->profile_max_candidates_per_page, pageCandidates);
+#endif
 			searchPage = IvfflatPageGetOpaque(page)->nextblkno;
 
 			UnlockReleaseBuffer(buf);
@@ -393,8 +466,10 @@ GetScanValue(IndexScanDesc scan)
 		}
 
 #ifdef IVFFLAT_BENCH
+		so->useFused2 = so->directL2Eligible &&
+			ivfflat_distance_path == IVFFLAT_DISTANCE_PATH_FUSED2;
 		so->useDirectL2 = so->directL2Eligible &&
-			ivfflat_distance_path == IVFFLAT_DISTANCE_PATH_DIRECT;
+			(ivfflat_distance_path == IVFFLAT_DISTANCE_PATH_DIRECT || so->useFused2);
 		if (so->useDirectL2)
 		{
 			MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
@@ -541,6 +616,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 #ifdef IVFFLAT_BENCH
 	so->directL2Eligible = false;
 	so->useDirectL2 = false;
+	so->useFused2 = false;
 	so->directQuery = NULL;
 	so->directQueryNeedsFree = false;
 #endif
@@ -604,6 +680,9 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->profile_returned_from_bounded = 0;
 	so->profile_returned_after_fallback = 0;
 #ifdef IVFFLAT_PROFILE_2B
+	so->profile_fused_pair_calls = so->profile_fused_candidates = 0;
+	so->profile_single_tail_candidates = so->profile_fused_fallback_candidates = 0;
+	so->profile_fused_distance_ns = 0;
 	so->profile_distance_calls = so->profile_candidate_extract_ns = 0;
 	so->profile_generic_distance_calls = so->profile_direct_distance_calls = 0;
 	so->profile_tuplesort_input_calls = so->profile_returned_rows = 0;
@@ -641,6 +720,7 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 	so->directQuery = NULL;
 	so->directQueryNeedsFree = false;
 	so->useDirectL2 = false;
+	so->useFused2 = false;
 #endif
 
 	/* Oracle bound has priority over the automatic limit-aware path */
@@ -832,7 +912,7 @@ ivfflatendscan(IndexScanDesc scan)
 		 so->profile_sort_us, so->profile_return_us,
 		 so->profile_list_us + so->profile_getitems_us + so->profile_return_us);
 #ifdef IVFFLAT_PROFILE_2B
-	elog(INFO, "IVFFLAT_PROFILE_2B probes=%d dimensions=%d selected_lists=%d scanned_candidates=%llu scanned_pages=%llu distance_calls=%llu tuplesort_input_calls=%llu returned_rows=%llu distance_path_requested=%d direct_l2_eligible=%d direct_l2_active=%d generic_distance_calls=%llu direct_distance_calls=%llu generic_distance_ns=%llu direct_distance_ns=%llu candidate_extract_ns=%llu distance_ns=%llu tuple_materialization_ns=%llu sort_insert_ns=%llu sort_finalize_ns=%llu scan_items_total_ns=%llu page_candidates_0=%llu page_candidates_1=%llu page_candidates_2=%llu page_candidates_3=%llu page_candidates_4plus=%llu max_candidates_per_page=%llu",
+	elog(INFO, "IVFFLAT_PROFILE_2B probes=%d dimensions=%d selected_lists=%d scanned_candidates=%llu scanned_pages=%llu distance_calls=%llu tuplesort_input_calls=%llu returned_rows=%llu distance_path_requested=%d direct_l2_eligible=%d direct_l2_active=%d generic_distance_calls=%llu direct_distance_calls=%llu generic_distance_ns=%llu direct_distance_ns=%llu candidate_extract_ns=%llu distance_ns=%llu tuple_materialization_ns=%llu sort_insert_ns=%llu sort_finalize_ns=%llu scan_items_total_ns=%llu page_candidates_0=%llu page_candidates_1=%llu page_candidates_2=%llu page_candidates_3=%llu page_candidates_4plus=%llu max_candidates_per_page=%llu fused2_active=%d fused_pair_calls=%llu fused_candidates=%llu single_tail_candidates=%llu fused_fallback_candidates=%llu fused_distance_ns=%llu",
 		 so->probes, so->dimensions, so->listIndex,
 		 (unsigned long long) so->profile_candidates, (unsigned long long) so->profile_pages,
 		 (unsigned long long) so->profile_distance_calls, (unsigned long long) so->profile_tuplesort_input_calls,
@@ -848,7 +928,12 @@ ivfflatendscan(IndexScanDesc scan)
 		 (unsigned long long) so->profile_scan_items_total_ns, (unsigned long long) so->profile_page_candidates[0],
 		 (unsigned long long) so->profile_page_candidates[1], (unsigned long long) so->profile_page_candidates[2],
 		 (unsigned long long) so->profile_page_candidates[3], (unsigned long long) so->profile_page_candidates[4],
-		 (unsigned long long) so->profile_max_candidates_per_page);
+		 (unsigned long long) so->profile_max_candidates_per_page, so->useFused2 ? 1 : 0,
+		 (unsigned long long) so->profile_fused_pair_calls,
+		 (unsigned long long) so->profile_fused_candidates,
+		 (unsigned long long) so->profile_single_tail_candidates,
+		 (unsigned long long) so->profile_fused_fallback_candidates,
+		 (unsigned long long) so->profile_fused_distance_ns);
 #endif
 #endif
 

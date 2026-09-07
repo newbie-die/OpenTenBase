@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -103,7 +104,7 @@ def parse_profile(notices):
                 if key in values:
                     values[key] = int(values[key])
             return values
-    raise RuntimeError("No IVFFLAT_PROFILE notice; build with PG_CFLAGS=-DIVFFLAT_BENCH")
+    raise RuntimeError("No IVFFLAT_PROFILE notice; build with IVFFLAT_PROFILE_CFLAGS=-DIVFFLAT_BENCH")
 
 
 def parse_profile_2b(notices):
@@ -798,279 +799,602 @@ def run_formal(conn, args):
           f"queries_per_config={args.queries} rows={len(rows)}", flush=True)
 
 
-def execute_correctness_query(conn, cur, config, query_literal, topk):
+PHASE2B_WORKLOAD_FIELDS = (
+    "selected_lists", "scanned_pages", "scanned_candidates", "distance_calls",
+    "tuplesort_input_calls", "physical_bound", "bounded_active",
+    "bounded_exhausted", "fallback_triggered", "returned_rows",
+    "page_candidates_0", "page_candidates_1", "page_candidates_2",
+    "page_candidates_3", "page_candidates_4plus",
+)
+PHASE2B_RESULT_FIELDS = (
+    "result_tids", "result_ids", "result_distances", "result_distance_bits",
+)
+FUSED2_COUNTERS = (
+    "fused_pair_calls", "fused_candidates", "single_tail_candidates",
+    "fused_fallback_candidates",
+)
+
+
+def require_check(condition, message):
+    # These checks must remain enabled under python -O.
+    if not condition:
+        raise RuntimeError(message)
+
+
+def configure_phase2b_scan(cur, probes, mode, distance_path):
+    cur.execute("SET enable_indexscan = on")
+    cur.execute("SET enable_seqscan = off")
+    for key, value in {
+        "iterative_scan": "off", "probes": str(probes),
+        "experimental_sort_bound": "0",
+        "bounded_scan": "on" if mode == "auto" else "off",
+        "bound_overfetch": "4", "bound_min": "40", "bound_fastpath_limit": "100",
+        "distance_path": distance_path,
+    }.items():
+        cur.execute("SELECT set_config(%s, %s, false)", (f"ivfflat.{key}", value))
+    cur.execute("SHOW ivfflat.distance_path")
+    require_check(cur.fetchone()[0] == distance_path, "distance_path was not applied")
+
+
+def execute_correctness_query(conn, cur, config, query_literal, topk,
+                              filter_divisor=None):
     conn.notices.clear()
+    where = "WHERE id %% %s = 0 " if filter_divisor is not None else ""
     sql = (f"SELECT ctid::text, id, embedding {config['operator']} %s::vector "
-           f"FROM {config['table']} "
+           f"FROM {config['table']} {where}"
            f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
-    cur.execute(sql, (query_literal, query_literal, topk))
+    params = [query_literal]
+    if filter_divisor is not None:
+        params.append(filter_divisor)
+    params.extend((query_literal, topk))
+    cur.execute(sql, params)
     results = [(row[0], int(row[1]), float(row[2])) for row in cur.fetchall()]
     profile = parse_profile_2b(conn.notices)
     profile.update(parse_profile(conn.notices))
     return results, profile
 
 
+def correctness_row(results, profile, config, mode, distance_path, query_id):
+    return {
+        "dataset": config["table"], "metric": config["metric"],
+        "mode": mode, "distance_path": distance_path, "query_id": query_id,
+        "result_tids": ";".join(r[0] for r in results),
+        "result_ids": ";".join(str(r[1]) for r in results),
+        "result_distances": ";".join(repr(r[2]) for r in results),
+        "result_distance_bits": ";".join(struct.pack("!d", r[2]).hex() for r in results),
+        **profile,
+    }
+
+
 def phase2b_correctness_config(conn, args, config, query_literals, mode,
                                 distance_path, query_count):
+    require_check(len(query_literals) >= max(query_count, args.warmup),
+                  "insufficient correctness queries")
     rows = []
     with conn.cursor() as cur:
         ensure_index(cur, config)
-        cur.execute("SET enable_indexscan = on")
+        configure_phase2b_scan(cur, args.probes_list[0], mode, distance_path)
+        for query_literal in query_literals[:args.warmup]:
+            execute_correctness_query(conn, cur, config, query_literal, args.topk)
+        for query_id, query_literal in enumerate(query_literals[:query_count]):
+            results, profile = execute_correctness_query(
+                conn, cur, config, query_literal, args.topk)
+            rows.append(correctness_row(results, profile, config, mode, distance_path, query_id))
+    return rows
+
+
+def verify_fused2_coverage(rows):
+    for row in rows:
+        for key in FUSED2_COUNTERS + ("fused2_active", "fused_distance_ns"):
+            require_check(key in row, f"missing FUSED2 instrumentation: {key}")
+        require_check(row["fused_candidates"] == 2 * row["fused_pair_calls"],
+                      "fused_candidates != 2 * fused_pair_calls")
+        require_check(row["fused_candidates"] + row["single_tail_candidates"] +
+                      row["fused_fallback_candidates"] == row["scanned_candidates"],
+                      "FUSED2 logical candidate accounting mismatch")
+        require_check(row["direct_distance_calls"] == row["single_tail_candidates"] +
+                      row["fused_fallback_candidates"], "FUSED2 DIRECT tail accounting mismatch")
+    totals = {key: sum(r[key] for r in rows) for key in
+              ("scanned_pages", "scanned_candidates", "direct_distance_calls",
+               "page_candidates_0", "page_candidates_1", "page_candidates_2",
+               "page_candidates_3", "page_candidates_4plus") + FUSED2_COUNTERS}
+    totals["fused_coverage_pct"] = (
+        100 * totals["fused_candidates"] / totals["scanned_candidates"]
+        if totals["scanned_candidates"] else 0.0)
+    return totals
+
+
+def verify_fused2_tail(rows):
+    """For the observed <=2-candidate pages, check the per-query pair/tail counts."""
+    for row in rows:
+        if row["page_candidates_3"] == row["page_candidates_4plus"] == 0:
+            require_check(row["fused_fallback_candidates"] == 0,
+                          "unexpected unpairable candidate in GIST workload")
+            require_check(row["single_tail_candidates"] == row["page_candidates_1"],
+                          "single-candidate pages did not all use DIRECT")
+            require_check(row["fused_pair_calls"] == row["page_candidates_2"],
+                          "two-candidate page / pair count mismatch")
+
+
+def validate_phase2b_dispatch(rows, distance_path, eligible=True):
+    if distance_path == "fused2" and eligible:
+        verify_fused2_coverage(rows)
+    for row in rows:
+        n = row["scanned_candidates"]
+        require_check(n == row["distance_calls"] == row["tuplesort_input_calls"],
+                      f"logical distance / tuplesort workload mismatch: {row}")
+        active = eligible and distance_path != "generic"
+        fused = active and distance_path == "fused2"
+        require_check(row["direct_l2_eligible"] == int(eligible) and
+                      row["direct_l2_active"] == int(active) and
+                      row.get("fused2_active", 0) == int(fused),
+                      f"invalid {distance_path} activation: {row}")
+        require_check(sum(row[f"page_candidates_{k}"] for k in
+                          ("0", "1", "2", "3", "4plus")) == row["scanned_pages"],
+                      "page histogram does not sum to scanned_pages")
+        require_check(row["distance_ns"] == row["generic_distance_ns"] +
+                      row["direct_distance_ns"] + row.get("fused_distance_ns", 0),
+                      "distance timer accounting mismatch")
+        if not active:
+            valid = (row["generic_distance_calls"] == n and
+                     row["direct_distance_calls"] == 0 and
+                     row["generic_distance_ns"] == row["distance_ns"])
+        elif fused:
+            valid = row["generic_distance_calls"] == row["generic_distance_ns"] == 0
+        else:
+            valid = (row["direct_distance_calls"] == n and
+                     row["generic_distance_calls"] == 0 and
+                     row["direct_distance_ns"] == row["distance_ns"])
+        if not fused:
+            valid = valid and all(row.get(k, 0) == 0 for k in FUSED2_COUNTERS)
+        require_check(valid, f"invalid {distance_path} dispatch: {row}")
+
+
+def compare_phase2b_paths(baseline_rows, test_rows, mode, baseline_path,
+                         test_path, expected_active=1):
+    baseline = {r["query_id"]: r for r in baseline_rows}
+    tested = {r["query_id"]: r for r in test_rows}
+    require_check(len(baseline) == len(baseline_rows) and
+                  len(tested) == len(test_rows) and baseline.keys() == tested.keys(),
+                  "baseline/test query IDs differ or contain duplicates")
+    validate_phase2b_dispatch(baseline_rows, baseline_path, bool(expected_active))
+    validate_phase2b_dispatch(test_rows, test_path, bool(expected_active))
+    result = {"mode": mode, "baseline_path": baseline_path, "test_path": test_path,
+              "queries": len(baseline)}
+    for key in PHASE2B_WORKLOAD_FIELDS + PHASE2B_RESULT_FIELDS:
+        result[f"{key}_mismatch"] = sum(baseline[q][key] != tested[q][key] for q in baseline)
+    for prefix, rows in (("baseline", baseline_rows), ("test", test_rows)):
+        for key in ("selected_lists", "scanned_pages", "scanned_candidates", "distance_calls",
+                    "tuplesort_input_calls", "returned_rows", "fallback_triggered"):
+            result[f"{prefix}_{key}"] = sum(row[key] for row in rows)
+    changed = 0
+    max_abs = max_rel = 0.0
+    for q in baseline:
+        a = [float(v) for v in baseline[q]["result_distances"].split(";") if v]
+        b = [float(v) for v in tested[q]["result_distances"].split(";") if v]
+        changed += abs(len(a) - len(b))
+        for x, y in zip(a, b):
+            changed += struct.pack("!d", x) != struct.pack("!d", y)
+            max_abs = max(max_abs, abs(x - y))
+            max_rel = max(max_rel, abs(x - y) / max(abs(x), abs(y)) if x or y else 0.0)
+    result.update(differing_distances=changed, max_absolute_difference=max_abs,
+                  max_relative_difference=max_rel,
+                  changed_topk_orders=result["result_tids_mismatch"],
+                  dispatch_counter_mismatch=0, direct_activation_mismatch=0)
+    # Preserve existing 2B-1 summary column names for consumers.
+    for old, new in {"selected_list": "selected_lists", "candidate": "scanned_candidates",
+                     "page": "scanned_pages", "distance_call": "distance_calls",
+                     "tuplesort_input": "tuplesort_input_calls", "returned_row": "returned_rows",
+                     "tid": "result_tids", "id": "result_ids", "fallback": "fallback_triggered"}.items():
+        result[f"{old}_mismatch"] = result[f"{new}_mismatch"]
+    return result
+
+
+def check_phase2b_comparison(summary):
+    require_check(not any(v for k, v in summary.items() if k.endswith("_mismatch")) and
+                  summary["differing_distances"] == 0,
+                  f"{summary['baseline_path']}/{summary['test_path']} correctness failed: {summary}")
+
+
+def verify_fused2_edges(args, query_literal, output):
+    # A separate session contains all temporary objects and edge-specific GUCs.
+    conn = connect(args)
+    conn.autocommit = True
+    reports = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("LOAD 'vector'")
+            def pair(label, config, mode, probes=64, filtered=False):
+                rows = []
+                for path in ("direct", "fused2"):
+                    configure_phase2b_scan(cur, probes, mode, path)
+                    results, profile = execute_correctness_query(
+                        conn, cur, config, query_literal, 10, 10 if filtered else None)
+                    row = correctness_row(results, profile, config, mode, path, 0)
+                    require_check(len({r[0] for r in results}) == len(results), "duplicate result TID")
+                    rows.append(row)
+                summary = compare_phase2b_paths(rows[:1], rows[1:], mode, "direct", "fused2")
+                reports.append({"label": label, "baseline": rows[0], "test": rows[1], "summary": summary})
+                write_json_atomic(Path(f"{output}_edges.json"), reports)
+                check_phase2b_comparison(summary)
+                return rows[1]
+            full = pair("filtered_full", CONFIGS["gist-l2"], "full", filtered=True)
+            auto = pair("forced_fallback", CONFIGS["gist-l2"], "auto", filtered=True)
+            require_check(auto["fallback_triggered"] == 1 and
+                          auto["returned_from_bounded"] > 0 and auto["returned_after_fallback"] > 0,
+                          "edge query did not exercise bounded returns and fallback")
+            require_check(all(auto[k] == full[k] for k in PHASE2B_RESULT_FIELDS),
+                          "filtered Full/Automatic results differ")
+            cur.execute("CREATE TEMP TABLE fused2_edge (id int, embedding vector(960))")
+            cur.execute("INSERT INTO fused2_edge SELECT i,array_fill((i::float4 / 10),ARRAY[960])::vector FROM generate_series(1,5) i")
+            cur.execute("INSERT INTO fused2_edge VALUES (6,NULL)")
+            cur.execute("CREATE INDEX fused2_edge_idx ON fused2_edge USING ivfflat(embedding vector_l2_ops) WITH (lists=1)")
+            cur.execute("ANALYZE fused2_edge")
+            config = dict(CONFIGS["gist-l2"], table="fused2_edge", index="fused2_edge_idx")
+            row = pair("two_pairs_one_tail_null_excluded", config, "full", probes=1)
+            require_check(row["fused_pair_calls"] == 2 and row["single_tail_candidates"] == 1 and
+                          row["scanned_candidates"] == 5, "pair/tail/NULL edge failed")
+            verify_fused2_tail([row])
+            cur.execute("DELETE FROM fused2_edge")
+            cur.execute("VACUUM fused2_edge")
+            row = pair("empty_pages_after_vacuum", config, "full", probes=1)
+            require_check(row["page_candidates_0"] > 0 and row["scanned_candidates"] == 0,
+                          "vacuum empty-page edge failed")
+    finally:
+        conn.close()
+    return reports
+
+
+def run_phase2b_correctness(conn, args):
+    if len(args.probes_list) != 1 or args.queries <= 0 or args.unsupported_queries <= 0 or args.warmup < 0:
+        raise ValueError("correctness requires one probes value, positive query counts and nonnegative warmup")
+    if args.baseline_path == args.test_path:
+        raise ValueError("baseline-path and test-path must differ")
+    if args.check_fused2_edges and "fused2" not in (args.baseline_path, args.test_path):
+        raise ValueError("--check-fused2-edges requires a fused2 comparison")
+    config = CONFIGS["gist-l2"]
+    queries, _ = load_workload(config, max(args.warmup, args.queries), args.topk)
+    literals = [vector_literal(q) for q in queries]
+    output = Path(args.output or ROOT / "results/phase_2b_correctness")
+    manifest = {"baseline_path": args.baseline_path, "test_path": args.test_path,
+                "queries": args.queries, "query_sha256": hashlib.sha256("\n".join(literals[:args.queries]).encode()).hexdigest(),
+                "probes": args.probes_list[0], "lists": args.lists, "topk": args.topk,
+                "dimension": 960, "iterative_scan": "off", "warmup": args.warmup}
+    with conn.cursor() as cur:
+        cur.execute("LOAD 'vector'")
+        cur.execute("SHOW ivfflat.distance_path")
+        require_check(cur.fetchone()[0] == "generic", "default distance_path must be generic")
+        cur.execute("SELECT oid, relfilenode, reloptions FROM pg_class WHERE oid=%s::regclass", (config["index"],))
+        manifest["index_before"] = cur.fetchone()
+        require_check(f"lists={args.lists}" in (manifest["index_before"][2] or []), "index lists differ from --lists")
+        cur.execute("SELECT version()")
+        manifest["version"] = cur.fetchone()[0]
+        cur.execute("SHOW ALL")
+        manifest["config_before"] = cur.fetchall()
+    raw, summaries, coverage = [], [], []
+    for mode in ("full", "auto"):
+        paths = {}
+        for path in (args.baseline_path, args.test_path):
+            rows = phase2b_correctness_config(conn, args, config, literals, mode, path, args.queries)
+            paths[path] = rows
+            raw.extend(rows)
+            write_csv(Path(f"{output}_raw.csv"), raw)
+            active = mode == "auto" and 0 < args.topk <= 100
+            for r in rows:
+                require_check(r["physical_bound"] == (max(40, args.topk * 4) if active else 0) and
+                              r["bounded_active"] == int(active), "unexpected tuple bound")
+                require_check(r["returned_rows"] == args.topk and
+                              len(r["result_ids"].split(";")) == args.topk, "incorrect result count")
+            if path == "fused2":
+                coverage.append({"mode": mode, "distance_path": path, **verify_fused2_coverage(rows)})
+                verify_fused2_tail(rows)
+            print(f"correctness mode={mode} path={path} queries={len(rows)} complete", flush=True)
+        summary = compare_phase2b_paths(paths[args.baseline_path], paths[args.test_path],
+                                        mode, args.baseline_path, args.test_path)
+        summaries.append(summary)
+        write_csv(Path(f"{output}_summary.csv"), summaries)
+        check_phase2b_comparison(summary)
+        with conn.cursor() as cur:
+            cur.execute("EXPLAIN (FORMAT JSON) SELECT ctid::text,id,embedding <-> %s::vector FROM gist_base ORDER BY embedding <-> %s::vector LIMIT %s", (literals[0], literals[0], args.topk))
+            plan = cur.fetchone()[0]
+            require_check(config["index"] in json.dumps(plan), "expected GIST index not used")
+            write_json_atomic(Path(f"{output}_plan_{mode}.json"), plan)
+    if coverage:
+        write_csv(Path(f"{output}_coverage.csv"), coverage)
+    unsupported, unsupported_summaries = [], []
+    for name in ("glove-ip", "glove-cosine"):
+        cfg = CONFIGS[name]
+        qs, _ = load_workload(cfg, max(args.warmup, args.unsupported_queries), args.topk)
+        ls = [vector_literal(q) for q in qs]
+        paths = {}
+        for path in (args.baseline_path, args.test_path):
+            paths[path] = phase2b_correctness_config(conn, args, cfg, ls, "full", path, args.unsupported_queries)
+            unsupported.extend(paths[path])
+        summary = compare_phase2b_paths(paths[args.baseline_path], paths[args.test_path], name,
+                                       args.baseline_path, args.test_path, expected_active=0)
+        unsupported_summaries.append(summary)
+        write_csv(Path(f"{output}_unsupported_raw.csv"), unsupported)
+        write_csv(Path(f"{output}_unsupported_summary.csv"), unsupported_summaries)
+        check_phase2b_comparison(summary)
+    if args.check_fused2_edges:
+        verify_fused2_edges(args, literals[0], output)
+    with conn.cursor() as cur:
+        cur.execute("SELECT oid, relfilenode, reloptions FROM pg_class WHERE oid=%s::regclass", (config["index"],))
+        manifest["index_after"] = cur.fetchone()
+    require_check(manifest["index_before"] == manifest["index_after"], "index changed during correctness run")
+    write_json_atomic(Path(f"{output}_manifest.json"), manifest)
+    print(f"PASS: {args.baseline_path}/{args.test_path} correctness", flush=True)
+
+
+def summarize_phase2b_path(rows, mode, probes, round_no, distance_path,
+                           order_position):
+    def total(key):
+        return sum(row[key] for row in rows)
+
+    pages = total("scanned_pages")
+    candidates = total("scanned_candidates")
+    scan_ns = total("scan_items_total_ns")
+    # Include DIRECT tails when profiling FUSED2.
+    path_ns_key = "distance_ns"
+    result = {
+        "mode": mode, "probes": probes, "round": round_no,
+        "order_position": order_position, "distance_path": distance_path,
+        "queries": len(rows), "selected_lists": total("selected_lists"),
+        "scanned_pages": pages, "scanned_candidates": candidates,
+        "distance_calls": total("distance_calls"),
+        "tuplesort_input_calls": total("tuplesort_input_calls"),
+        "fallback_queries": total("fallback_triggered"),
+        "returned_rows": total("returned_rows"),
+        "generic_distance_calls": total("generic_distance_calls"),
+        "direct_distance_calls": total("direct_distance_calls"),
+        "generic_distance_ns": total("generic_distance_ns"),
+        "direct_distance_ns": total("direct_distance_ns"),
+        "distance_ns": total("distance_ns"),
+        "distance_ns_per_candidate": total(path_ns_key) / candidates,
+        "candidate_extract_ns": total("candidate_extract_ns"),
+        "tuple_materialization_ns": total("tuple_materialization_ns"),
+        "sort_insert_ns": total("sort_insert_ns"),
+        "sort_finalize_ns": total("sort_finalize_ns"),
+        "scan_items_total_ns": scan_ns,
+        "distance_pct": 100 * total(path_ns_key) / scan_ns,
+        "candidate_extraction_pct":
+            100 * total("candidate_extract_ns") / scan_ns,
+        "sort_insertion_pct": 100 * total("sort_insert_ns") / scan_ns,
+        "sort_finalize_pct": 100 * total("sort_finalize_ns") / scan_ns,
+        "average_candidates_per_page": candidates / pages,
+        "max_candidates_per_page":
+            max(row["max_candidates_per_page"] for row in rows),
+    }
+    for key in FUSED2_COUNTERS + ("fused_distance_ns",):
+        result[key] = sum(row.get(key, 0) for row in rows)
+    result["fused_coverage_pct"] = 100 * result["fused_candidates"] / candidates
+    return result
+
+
+def compare_phase2b_profile_pair(baseline, test):
+    equality_fields = (
+        "queries", "selected_lists", "scanned_pages", "scanned_candidates",
+        "distance_calls", "tuplesort_input_calls", "fallback_queries", "returned_rows",
+    )
+    differences = {
+        field: baseline[field] - test[field] for field in equality_fields
+    }
+    logic_equal = all(value == 0 for value in differences.values())
+    baseline_ns = baseline["distance_ns_per_candidate"]
+    test_ns = test["distance_ns_per_candidate"]
+    saved_ns = baseline_ns - test_ns
+    result = {
+        "mode": baseline["mode"], "probes": baseline["probes"],
+        "round": baseline["round"], "queries": baseline["queries"],
+        "baseline_path": baseline["distance_path"], "test_path": test["distance_path"],
+        "order": "-".join(row["distance_path"] for row in
+                          sorted((baseline, test), key=lambda row: row["order_position"])),
+        "baseline_pages": baseline["scanned_pages"],
+        "test_pages": test["scanned_pages"],
+        "page_difference": differences["scanned_pages"],
+        "baseline_candidates": baseline["scanned_candidates"],
+        "test_candidates": test["scanned_candidates"],
+        "candidate_difference": differences["scanned_candidates"],
+        "baseline_distance_calls": baseline["distance_calls"],
+        "test_distance_calls": test["distance_calls"],
+        "distance_call_difference": differences["distance_calls"],
+        "selected_list_difference": differences["selected_lists"],
+        "logic_workload_equal": logic_equal,
+        "baseline_ns_per_candidate": baseline_ns,
+        "test_ns_per_candidate": test_ns,
+        "saved_ns_per_candidate": saved_ns,
+        "distance_stage_speedup": baseline_ns / test_ns,
+        "test_distance_improvement_pct": 100 * saved_ns / baseline_ns,
+        "baseline_scan_items_total_ns": baseline["scan_items_total_ns"],
+        "test_scan_items_total_ns": test["scan_items_total_ns"],
+        "baseline_candidate_extract_ns": baseline["candidate_extract_ns"],
+        "test_candidate_extract_ns": test["candidate_extract_ns"],
+        "baseline_sort_insert_ns": baseline["sort_insert_ns"],
+        "test_sort_insert_ns": test["sort_insert_ns"],
+        "baseline_sort_finalize_ns": baseline["sort_finalize_ns"],
+        "test_sort_finalize_ns": test["sort_finalize_ns"],
+    }
+
+    result["scan_items_speedup"] = baseline["scan_items_total_ns"] / test["scan_items_total_ns"]
+    result["scan_items_improvement_pct"] = 100 * (1 - test["scan_items_total_ns"] / baseline["scan_items_total_ns"])
+    # Keep historical G/D columns only for the original comparison.
+    if (baseline["distance_path"], test["distance_path"]) == ("generic", "direct"):
+        for key, value in list(result.items()):
+            if key.startswith("baseline_") and key != "baseline_path":
+                result[key.replace("baseline_", "generic_", 1)] = value
+            elif key.startswith("test_") and key != "test_path":
+                result[key.replace("test_", "direct_", 1)] = value
+    return result
+
+
+def summarize_phase2b_pairs(pairs):
+    output = []
+    for mode, probes in sorted({
+            (row["mode"], row["probes"]) for row in pairs}):
+        group = [
+            row for row in pairs
+            if row["mode"] == mode and row["probes"] == probes
+        ]
+        result = {
+            "mode": mode, "probes": probes, "rounds": len(group),
+            "baseline_path": group[0]["baseline_path"], "test_path": group[0]["test_path"],
+            "queries_per_path_per_round": group[0]["queries"],
+            "all_logic_workloads_equal":
+                all(row["logic_workload_equal"] for row in group),
+        }
+        metrics = (
+            "baseline_ns_per_candidate", "test_ns_per_candidate",
+            "saved_ns_per_candidate", "distance_stage_speedup",
+            "test_distance_improvement_pct", "scan_items_speedup", "scan_items_improvement_pct",
+        )
+        for metric in metrics:
+            values = [row[metric] for row in group]
+            mean = statistics.fmean(values)
+            result[f"{metric}_median"] = statistics.median(values)
+            result[f"{metric}_min"] = min(values)
+            result[f"{metric}_max"] = max(values)
+            result[f"{metric}_variance"] = statistics.pvariance(values)
+            result[f"{metric}_run_range"] = max(values) - min(values)
+            result[f"{metric}_cv_pct"] = (
+                100 * statistics.pstdev(values) / abs(mean) if mean else 0.0
+            )
+        if (result["baseline_path"], result["test_path"]) == ("generic", "direct"):
+            for key, value in list(result.items()):
+                if key.startswith("baseline_") and key != "baseline_path":
+                    result[key.replace("baseline_", "generic_", 1)] = value
+                elif key.startswith("test_") and key != "test_path":
+                    result[key.replace("test_", "direct_", 1)] = value
+        output.append(result)
+    return output
+
+
+def run_phase2b(conn, args):
+    config = CONFIGS["gist-l2"]
+    queries, _ = load_workload(
+        config, max(args.warmup, args.queries), args.topk)
+    modes = ("full", "auto") if args.mode == "both" else (args.mode,)
+    interleaved = args.distance_path == "interleaved"
+    if args.queries <= 0 or args.warmup < 0:
+        raise ValueError("queries must be positive and warmup nonnegative")
+    if interleaved and args.baseline_path == args.test_path:
+        raise ValueError("baseline-path and test-path must differ")
+    require_check(len(queries) >= max(args.queries, args.warmup), "insufficient query vectors")
+    round_count = args.rounds if interleaved else 1
+    if round_count <= 0:
+        raise ValueError("rounds must be positive")
+
+    output = Path(args.output or ROOT / "results/phase_2b_profile")
+    raw_path = Path(f"{output}_raw.csv")
+    runs_path = Path(f"{output}_runs.csv")
+    raw_rows = []
+    run_summaries = []
+
+    with conn.cursor() as cur:
+        ensure_index(cur, config)
         cur.execute("SET enable_seqscan = off")
         cur.execute("SET ivfflat.iterative_scan = off")
         cur.execute("SELECT set_config(%s, %s, false)",
-                    ("ivfflat.probes", str(args.probes_list[0])))
-        cur.execute("SELECT set_config(%s, %s, false)",
                     ("ivfflat.experimental_sort_bound", "0"))
-        cur.execute("SELECT set_config(%s, %s, false)",
-                    ("ivfflat.bounded_scan", "on" if mode == "auto" else "off"))
         cur.execute("SELECT set_config(%s, %s, false)",
                     ("ivfflat.bound_overfetch", "4"))
         cur.execute("SELECT set_config(%s, %s, false)",
                     ("ivfflat.bound_min", "40"))
         cur.execute("SELECT set_config(%s, %s, false)",
                     ("ivfflat.bound_fastpath_limit", "100"))
-        cur.execute("SELECT set_config(%s, %s, false)",
-                    ("ivfflat.distance_path", distance_path))
-        cur.execute("SHOW ivfflat.distance_path")
-        if cur.fetchone()[0] != distance_path:
-            raise RuntimeError("ivfflat.distance_path verification failed")
 
-        for query_literal in query_literals[:args.warmup]:
-            execute_correctness_query(conn, cur, config, query_literal, args.topk)
-        for query_id, query_literal in enumerate(query_literals[:query_count]):
-            results, profile = execute_correctness_query(
-                conn, cur, config, query_literal, args.topk)
-            distances = [result[2] for result in results]
-            rows.append({
-                "dataset": config["table"], "metric": config["metric"],
-                "mode": mode, "distance_path": distance_path,
-                "query_id": query_id,
-                "result_tids": ";".join(result[0] for result in results),
-                "result_ids": ";".join(str(result[1]) for result in results),
-                "result_distances": ";".join(repr(value) for value in distances),
-                "result_distance_bits": ";".join(
-                    struct.pack("!d", value).hex() for value in distances),
-                **profile,
-            })
-    return rows
+        for mode in modes:
+            cur.execute("SELECT set_config(%s, %s, false)",
+                        ("ivfflat.bounded_scan",
+                         "on" if mode == "auto" else "off"))
+            for probes in args.probes_list:
+                cur.execute("SELECT set_config(%s, %s, false)",
+                            ("ivfflat.probes", str(probes)))
+                for round_no in range(1, round_count + 1):
+                    if interleaved:
+                        path_order = (
+                            (args.baseline_path, args.test_path) if round_no % 2
+                            else (args.test_path, args.baseline_path)
+                        )
+                    else:
+                        path_order = (args.distance_path,)
+                    for order_position, distance_path in enumerate(
+                            path_order, start=1):
+                        print(
+                            f"phase2b mode={mode} probes={probes} "
+                            f"round={round_no} order={order_position} "
+                            f"path={distance_path} warmup={args.warmup} "
+                            f"queries={args.queries}",
+                            flush=True)
+                        cur.execute("SELECT set_config(%s, %s, false)",
+                                    ("ivfflat.distance_path", distance_path))
+                        for query in queries[:args.warmup]:
+                            execute_query(
+                                conn, cur, config, query, args.topk, False)
 
+                        path_rows = []
+                        for query_id, query in enumerate(
+                                queries[:args.queries]):
+                            conn.notices.clear()
+                            _, _, profile = execute_query(
+                                conn, cur, config, query, args.topk, True)
+                            row = parse_profile_2b(conn.notices)
+                            row.update(profile)
+                            row.update(
+                                query_id=query_id, mode=mode, probes=probes,
+                                round=round_no,
+                                order_position=order_position,
+                                distance_path=distance_path)
+                            path_rows.append(row)
+                            raw_rows.append(row)
 
-def compare_phase2b_paths(generic_rows, direct_rows, mode, expected_active):
-    generic_by_query = {row["query_id"]: row for row in generic_rows}
-    direct_by_query = {row["query_id"]: row for row in direct_rows}
-    if generic_by_query.keys() != direct_by_query.keys():
-        raise RuntimeError("generic/direct query sets differ")
+                        validate_phase2b_dispatch(path_rows, distance_path)
+                        run_summaries.append(summarize_phase2b_path(
+                            path_rows, mode, probes, round_no,
+                            distance_path, order_position))
+                        write_csv_atomic(
+                            raw_path, raw_rows, tuple(raw_rows[0].keys()))
+                        write_csv_atomic(
+                            runs_path, run_summaries,
+                            tuple(run_summaries[0].keys()))
 
-    counter_fields = (
-        "selected_lists", "scanned_pages", "scanned_candidates",
-        "distance_calls", "tuplesort_input_calls", "returned_rows",
-    )
-    mismatch_counts = {field: 0 for field in counter_fields}
-    fallback_mismatch = 0
-    tid_mismatch = 0
-    id_mismatch = 0
-    differing_distances = 0
-    max_absolute_difference = 0.0
-    max_relative_difference = 0.0
-    active_mismatch = 0
-    dispatch_counter_mismatch = 0
+    if not interleaved:
+        write_csv(Path(f"{output}_summary.csv"), run_summaries)
+        return
 
-    for query_id in sorted(generic_by_query):
-        generic = generic_by_query[query_id]
-        direct = direct_by_query[query_id]
-        for field in counter_fields:
-            mismatch_counts[field] += int(generic[field] != direct[field])
-        fallback_mismatch += int(
-            generic["fallback_triggered"] != direct["fallback_triggered"])
-        tid_mismatch += int(generic["result_tids"] != direct["result_tids"])
-        id_mismatch += int(generic["result_ids"] != direct["result_ids"])
-        active_mismatch += int(direct["direct_l2_active"] != expected_active)
-
-        generic_dispatch_ok = (
-            generic["generic_distance_calls"] == generic["distance_calls"] and
-            generic["direct_distance_calls"] == 0)
-        if expected_active:
-            direct_dispatch_ok = (
-                direct["direct_distance_calls"] == direct["distance_calls"] and
-                direct["generic_distance_calls"] == 0)
-        else:
-            direct_dispatch_ok = (
-                direct["generic_distance_calls"] == direct["distance_calls"] and
-                direct["direct_distance_calls"] == 0)
-        dispatch_counter_mismatch += int(
-            not generic_dispatch_ok or not direct_dispatch_ok)
-
-        generic_distances = [float(value) for value in
-                             generic["result_distances"].split(";") if value]
-        direct_distances = [float(value) for value in
-                            direct["result_distances"].split(";") if value]
-        if len(generic_distances) != len(direct_distances):
-            differing_distances += abs(
-                len(generic_distances) - len(direct_distances))
-        for generic_distance, direct_distance in zip(
-                generic_distances, direct_distances):
-            if (struct.pack("!d", generic_distance) !=
-                    struct.pack("!d", direct_distance)):
-                differing_distances += 1
-            absolute = abs(generic_distance - direct_distance)
-            denominator = max(abs(generic_distance), abs(direct_distance))
-            relative = absolute / denominator if denominator else 0.0
-            max_absolute_difference = max(max_absolute_difference, absolute)
-            max_relative_difference = max(max_relative_difference, relative)
-
-    return {
-        "mode": mode, "queries": len(generic_by_query),
-        "selected_list_mismatch": mismatch_counts["selected_lists"],
-        "candidate_mismatch": mismatch_counts["scanned_candidates"],
-        "page_mismatch": mismatch_counts["scanned_pages"],
-        "distance_call_mismatch": mismatch_counts["distance_calls"],
-        "tuplesort_input_mismatch":
-            mismatch_counts["tuplesort_input_calls"],
-        "returned_row_mismatch": mismatch_counts["returned_rows"],
-        "tid_mismatch": tid_mismatch, "id_mismatch": id_mismatch,
-        "fallback_mismatch": fallback_mismatch,
-        "differing_distances": differing_distances,
-        "max_absolute_difference": max_absolute_difference,
-        "max_relative_difference": max_relative_difference,
-        "changed_topk_orders": tid_mismatch,
-        "direct_activation_mismatch": active_mismatch,
-        "dispatch_counter_mismatch": dispatch_counter_mismatch,
-    }
-
-
-def run_phase2b_correctness(conn, args):
-    if len(args.probes_list) != 1:
-        raise ValueError("2b-correctness requires exactly one probes value")
-    if args.queries <= 0 or args.unsupported_queries <= 0:
-        raise ValueError("correctness query counts must be positive")
-
-    config = CONFIGS["gist-l2"]
-    load_count = max(args.warmup, args.queries)
-    queries, _ = load_workload(config, load_count, args.topk)
-    query_literals = [vector_literal(query) for query in queries]
-    raw_rows = []
-    summaries = []
-    for mode in ("full", "auto"):
-        generic_rows = phase2b_correctness_config(
-            conn, args, config, query_literals, mode, "generic", args.queries)
-        direct_rows = phase2b_correctness_config(
-            conn, args, config, query_literals, mode, "direct", args.queries)
-        raw_rows.extend(generic_rows)
-        raw_rows.extend(direct_rows)
-        summaries.append(compare_phase2b_paths(
-            generic_rows, direct_rows, mode, expected_active=1))
-
-    unsupported_raw = []
-    unsupported_summaries = []
-    for name in ("glove-ip", "glove-cosine"):
-        unsupported_config = CONFIGS[name]
-        unsupported_load_count = max(args.warmup, args.unsupported_queries)
-        unsupported_queries, _ = load_workload(
-            unsupported_config, unsupported_load_count, args.topk)
-        unsupported_literals = [
-            vector_literal(query) for query in unsupported_queries]
-        generic_rows = phase2b_correctness_config(
-            conn, args, unsupported_config, unsupported_literals,
-            "full", "generic", args.unsupported_queries)
-        direct_rows = phase2b_correctness_config(
-            conn, args, unsupported_config, unsupported_literals,
-            "full", "direct", args.unsupported_queries)
-        unsupported_raw.extend(generic_rows)
-        unsupported_raw.extend(direct_rows)
-        summary = compare_phase2b_paths(
-            generic_rows, direct_rows, name, expected_active=0)
-        summary["metric"] = unsupported_config["metric"]
-        unsupported_summaries.append(summary)
-
-    output = Path(
-        args.output or ROOT / "results/phase_2b_direct_correctness")
-    write_csv(Path(f"{output}_raw.csv"), raw_rows)
-    write_csv(Path(f"{output}_summary.csv"), summaries)
-    write_csv(Path(f"{output}_unsupported_raw.csv"), unsupported_raw)
-    write_csv(
-        Path(f"{output}_unsupported_summary.csv"), unsupported_summaries)
-
-    failure_fields = (
-        "selected_list_mismatch", "candidate_mismatch", "page_mismatch",
-        "distance_call_mismatch", "tuplesort_input_mismatch",
-        "returned_row_mismatch", "tid_mismatch", "id_mismatch",
-        "fallback_mismatch", "differing_distances", "changed_topk_orders",
-        "direct_activation_mismatch", "dispatch_counter_mismatch",
-    )
-    failures = [row for row in summaries + unsupported_summaries
-                if any(row[field] for field in failure_fields)]
-    if failures:
-        raise RuntimeError(
-            f"DIRECT correctness validation failed: {failures}")
-
-
-def run_phase2b(conn, args):
-    config = CONFIGS["gist-l2"]
-    queries, _ = load_workload(config, max(args.warmup, args.queries), args.topk)
-    raw_rows = []
-    with conn.cursor() as cur:
-        ensure_index(cur, config)
-        cur.execute("SET enable_seqscan = off")
-        cur.execute("SET ivfflat.iterative_scan = off")
-        cur.execute("SELECT set_config('ivfflat.experimental_sort_bound', '0', false)")
-        cur.execute("SELECT set_config('ivfflat.bounded_scan', %s, false)",
-                    ("on" if args.mode == "auto" else "off",))
-        cur.execute("SELECT set_config('ivfflat.bound_overfetch', '4', false)")
-        cur.execute("SELECT set_config('ivfflat.bound_min', '40', false)")
-        cur.execute("SELECT set_config('ivfflat.bound_fastpath_limit', '100', false)")
-        cur.execute("SELECT set_config('ivfflat.distance_path', %s, false)",
-                    (args.distance_path,))
+    pairs = []
+    for mode in modes:
         for probes in args.probes_list:
-            cur.execute("SELECT set_config('ivfflat.probes', %s, false)", (str(probes),))
-            for query in queries[:args.warmup]:
-                execute_query(conn, cur, config, query, args.topk, False)
-            for query_id, query in enumerate(queries[:args.queries]):
-                conn.notices.clear()
-                _, _, profile = execute_query(conn, cur, config, query, args.topk, True)
-                row = parse_profile_2b(conn.notices)
-                row.update(profile)
-                row.update(query_id=query_id, mode=args.mode,
-                           distance_path=args.distance_path)
-                raw_rows.append(row)
-    summaries = []
-    for probes in args.probes_list:
-        group = [row for row in raw_rows if row["probes"] == probes]
-        total = lambda key: sum(row[key] for row in group)
-        pages = total("scanned_pages")
-        candidates = total("scanned_candidates")
-        scan_ns = total("scan_items_total_ns")
-        summary = {"mode": args.mode, "distance_path": args.distance_path,
-                   "probes": probes, "queries": len(group),
-                   "scanned_pages": pages, "scanned_candidates": candidates,
-                   "distance_calls": total("distance_calls"),
-                   "avg_pages_per_query": pages / len(group),
-                   "avg_candidates_per_query": candidates / len(group),
-                   "distance_ns_per_candidate": total("distance_ns") / candidates,
-                   "candidate_extract_ns": total("candidate_extract_ns"),
-                   "distance_ns": total("distance_ns"),
-                   "tuple_materialization_ns": total("tuple_materialization_ns"),
-                   "sort_insert_ns": total("sort_insert_ns"),
-                   "sort_finalize_ns": total("sort_finalize_ns"),
-                   "scan_items_total_ns": scan_ns,
-                   "distance_pct": 100 * total("distance_ns") / scan_ns,
-                   "candidate_extraction_pct": 100 * total("candidate_extract_ns") / scan_ns,
-                   "tuple_materialization_pct": 100 * total("tuple_materialization_ns") / scan_ns,
-                   "sort_insertion_pct": 100 * total("sort_insert_ns") / scan_ns,
-                   "sort_finalize_pct": 100 * total("sort_finalize_ns") / scan_ns,
-                   "average_candidates_per_page": candidates / pages,
-                   "max_candidates_per_page": max(row["max_candidates_per_page"] for row in group)}
-        for bucket in (0, 1, 2, 3):
-            count = total(f"page_candidates_{bucket}")
-            summary[f"page_candidates_{bucket}"] = count
-            summary[f"page_candidates_{bucket}_pct"] = 100 * count / pages
-        count = total("page_candidates_4plus")
-        summary["page_candidates_4plus"] = count
-        summary["page_candidates_4plus_pct"] = 100 * count / pages
-        summaries.append(summary)
-    output = Path(args.output or ROOT / "results/phase_2b_profile")
-    write_csv(Path(f"{output}_raw.csv"), raw_rows)
+            for round_no in range(1, round_count + 1):
+                group = [
+                    row for row in run_summaries
+                    if row["mode"] == mode and row["probes"] == probes and
+                    row["round"] == round_no
+                ]
+                baseline = next(row for row in group if row["distance_path"] == args.baseline_path)
+                tested = next(row for row in group if row["distance_path"] == args.test_path)
+                pair = compare_phase2b_profile_pair(baseline, tested)
+                by_path = {
+                    path: {r["query_id"]: r for r in raw_rows
+                           if r["mode"] == mode and r["probes"] == probes and
+                           r["round"] == round_no and r["distance_path"] == path}
+                    for path in (args.baseline_path, args.test_path)
+                }
+                a, b = by_path[args.baseline_path], by_path[args.test_path]
+                pair["workload_mismatch_queries"] = sum(
+                    any(a[q][k] != b[q][k] for k in PHASE2B_WORKLOAD_FIELDS) for q in a)
+                pair["logic_workload_equal"] &= pair["workload_mismatch_queries"] == 0
+                pairs.append(pair)
+
+    pair_path = Path(f"{output}_paired.csv")
+    write_csv(pair_path, pairs)
+    summaries = summarize_phase2b_pairs(pairs)
     write_csv(Path(f"{output}_summary.csv"), summaries)
+    invalid = [row for row in pairs if not row["logic_workload_equal"]]
+    if invalid:
+        raise RuntimeError(
+            f"{args.baseline_path}/{args.test_path} logical workload mismatch: {invalid}")
+
+
 
 
 def run_experiment(args):
@@ -1181,6 +1505,27 @@ def build_indexes(args):
     write_csv(args.output or ROOT / "results/index_build.csv", rows)
 
 
+def validate_phase2b_options(args):
+    if args.phase not in ("2b", "2b-correctness"):
+        if args.check_fused2_edges:
+            raise ValueError("--check-fused2-edges is only supported by 2b-correctness")
+        return
+    if args.queries <= 0 or args.warmup < 0 or args.topk <= 0 or args.lists <= 0:
+        raise ValueError("queries/topk/lists must be positive; warmup must be nonnegative")
+    if not args.probes_list or any(p <= 0 or p > args.lists for p in args.probes_list):
+        raise ValueError("probes must be between 1 and lists")
+    paired = args.phase == "2b-correctness" or args.distance_path == "interleaved"
+    if paired and args.baseline_path == args.test_path:
+        raise ValueError("baseline-path and test-path must differ")
+    if args.phase == "2b-correctness":
+        if len(args.probes_list) != 1 or args.unsupported_queries <= 0:
+            raise ValueError("correctness requires one probes value and positive unsupported-queries")
+    elif args.rounds <= 0 or args.check_fused2_edges:
+        raise ValueError("profiling requires positive rounds; edge checks belong to 2b-correctness")
+    if args.check_fused2_edges and "fused2" not in (args.baseline_path, args.test_path):
+        raise ValueError("--check-fused2-edges requires a fused2 comparison")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -1203,9 +1548,15 @@ def main():
     run.add_argument("--sort-bounds", type=parse_int_list, default=(0, 10, 20, 40, 100))
     run.add_argument("--rounds", type=int, default=3)
     run.add_argument("--lists", type=int, default=1000)
-    run.add_argument("--mode", choices=("full", "auto"), default="full")
-    run.add_argument("--distance-path", choices=("generic", "direct"),
+    run.add_argument("--mode", choices=("full", "auto", "both"),
+                     default="full")
+    run.add_argument("--distance-path",
+                     choices=("generic", "direct", "fused2", "interleaved"),
                      default="generic")
+    run.add_argument("--baseline-path", choices=("generic", "direct", "fused2"), default="generic")
+    run.add_argument("--test-path", choices=("generic", "direct", "fused2"), default="direct")
+    run.add_argument("--check-fused2-edges", action="store_true")
+    run.add_argument("--validate-only", action="store_true", help="validate run options without connecting to PostgreSQL")
     run.add_argument("--unsupported-queries", type=int, default=10)
     run.add_argument("--output", type=Path)
     run.add_argument("--resume", action="store_true")
@@ -1215,6 +1566,10 @@ def main():
     if args.command == "build":
         build_indexes(args)
     else:
+        validate_phase2b_options(args)
+        if args.validate_only:
+            print("run options valid")
+            return
         run_experiment(args)
 
 

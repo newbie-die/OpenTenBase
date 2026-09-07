@@ -129,7 +129,8 @@ typedef enum IvfflatIterativeScanMode
 typedef enum IvfflatDistancePath
 {
 	IVFFLAT_DISTANCE_PATH_GENERIC,
-	IVFFLAT_DISTANCE_PATH_DIRECT
+	IVFFLAT_DISTANCE_PATH_DIRECT,
+	IVFFLAT_DISTANCE_PATH_FUSED2
 }			IvfflatDistancePath;
 #endif
 
@@ -311,6 +312,7 @@ typedef struct IvfflatScanOpaqueData
 #ifdef IVFFLAT_BENCH
 	bool		directL2Eligible;
 	bool		useDirectL2;
+	bool		useFused2;
 	Vector	   *directQuery;
 	bool		directQueryNeedsFree;
 #endif
@@ -351,6 +353,9 @@ typedef struct IvfflatScanOpaqueData
 	uint64		profile_returned_from_bounded;
 	uint64		profile_returned_after_fallback;
 #ifdef IVFFLAT_PROFILE_2B
+	uint64 profile_fused_pair_calls, profile_fused_candidates;
+	uint64 profile_single_tail_candidates, profile_fused_fallback_candidates;
+	uint64 profile_fused_distance_ns;
 	uint64 profile_distance_calls, profile_candidate_extract_ns;
 	uint64 profile_generic_distance_calls, profile_direct_distance_calls;
 	uint64 profile_tuplesort_input_calls, profile_returned_rows;

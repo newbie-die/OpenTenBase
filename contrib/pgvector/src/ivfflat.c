@@ -44,6 +44,7 @@ static const struct config_enum_entry ivfflat_iterative_scan_options[] = {
 static const struct config_enum_entry ivfflat_distance_path_options[] = {
 	{"generic", IVFFLAT_DISTANCE_PATH_GENERIC, false},
 	{"direct", IVFFLAT_DISTANCE_PATH_DIRECT, false},
+	{"fused2", IVFFLAT_DISTANCE_PATH_FUSED2, false},
 	{NULL, 0, false}
 };
 #endif

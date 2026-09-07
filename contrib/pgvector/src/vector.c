@@ -573,6 +573,34 @@ VectorL2SquaredDistanceRaw(int dim, const float *ax, const float *bx)
 	return distance;
 }
 
+#ifdef IVFFLAT_BENCH
+/*
+ * Share each query load across two independent L2 reductions.
+ */
+VECTOR_TARGET_CLONES void
+VectorL2SquaredDistancePairRaw(int dim, const float *query,
+							   const float *a, const float *b,
+							   float *distance_a, float *distance_b)
+{
+	float		sum_a = 0.0f;
+	float		sum_b = 0.0f;
+
+	/* Auto-vectorized with the same floating-point policy as Raw. */
+	for (int i = 0; i < dim; i++)
+	{
+		float		q = query[i];
+		float		da = a[i] - q;
+		float		db = b[i] - q;
+
+		sum_a += da * da;
+		sum_b += db * db;
+	}
+
+	*distance_a = sum_a;
+	*distance_b = sum_b;
+}
+#endif
+
 /*
  * Get the L2 distance between vectors
  */
