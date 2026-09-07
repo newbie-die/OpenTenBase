@@ -26,6 +26,43 @@
 #define GetScanList(ptr) pairingheap_container(IvfflatScanList, ph_node, ptr)
 #define GetScanListConst(ptr) pairingheap_const_container(IvfflatScanList, ph_node, ptr)
 
+#ifdef IVFFLAT_BENCH
+/*
+ * Calculate L2 distance without fmgr while preserving varlena and dimension
+ * safety.  The common IVFFlat entry representation takes the first branch.
+ */
+static Datum
+DirectL2Distance(IvfflatScanOpaque so, Datum datum)
+{
+	Pointer		original = DatumGetPointer(datum);
+	Vector	   *candidate;
+	bool		freeCandidate = false;
+	Datum		result;
+
+	if (likely(!VARATT_IS_EXTENDED(original)))
+		candidate = (Vector *) original;
+	else
+	{
+		candidate = DatumGetVector(datum);
+		freeCandidate = ((Pointer) candidate != original);
+	}
+
+	if (unlikely(candidate->dim != so->directQuery->dim))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("different vector dimensions %d and %d",
+						candidate->dim, so->directQuery->dim)));
+
+	result = Float8GetDatum((double) VectorL2SquaredDistanceRaw(candidate->dim,
+												 candidate->x, so->directQuery->x));
+
+	if (freeCandidate)
+		pfree(candidate);
+
+	return result;
+}
+#endif
+
 /*
  * Compare list distances
  */
@@ -213,13 +250,32 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #ifdef IVFFLAT_BENCH
 				INSTR_TIME_SET_CURRENT(distance_start);
 #endif
-				slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
+#ifdef IVFFLAT_BENCH
+				if (so->useDirectL2)
+				{
+					slot->tts_values[0] = DirectL2Distance(so, datum);
+#ifdef IVFFLAT_PROFILE_2B
+					so->profile_direct_distance_calls++;
+#endif
+				}
+				else
+#endif
+				{
+					slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
+#ifdef IVFFLAT_PROFILE_2B
+					so->profile_generic_distance_calls++;
+#endif
+				}
 #ifdef IVFFLAT_BENCH
 				INSTR_TIME_SET_CURRENT(elapsed);
 				INSTR_TIME_SUBTRACT(elapsed, distance_start);
 				so->profile_distance_us += INSTR_TIME_GET_MICROSEC(elapsed);
 #ifdef IVFFLAT_PROFILE_2B
 				so->profile_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+				if (so->useDirectL2)
+					so->profile_direct_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
+				else
+					so->profile_generic_distance_ns += INSTR_TIME_GET_NANOSEC(elapsed);
 				so->profile_distance_calls++;
 #endif
 #endif
@@ -239,6 +295,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 
 				tuplesort_puttupleslot(so->sortstate, slot);
 #ifdef IVFFLAT_PROFILE_2B
+				so->profile_tuplesort_input_calls++;
 				INSTR_TIME_SET_CURRENT(elapsed);
 				INSTR_TIME_SUBTRACT(elapsed, segment_start);
 				so->profile_sort_insert_ns += INSTR_TIME_GET_NANOSEC(elapsed);
@@ -334,6 +391,26 @@ GetScanValue(IndexScanDesc scan)
 
 			MemoryContextSwitchTo(oldCtx);
 		}
+
+#ifdef IVFFLAT_BENCH
+		so->useDirectL2 = so->directL2Eligible &&
+			ivfflat_distance_path == IVFFLAT_DISTANCE_PATH_DIRECT;
+		if (so->useDirectL2)
+		{
+			MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
+			so->directQuery = DatumGetVector(value);
+			so->directQueryNeedsFree =
+				((Pointer) so->directQuery != DatumGetPointer(value));
+			MemoryContextSwitchTo(oldCtx);
+
+			if (so->directQuery->dim != so->dimensions)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("different vector dimensions %d and %d",
+								so->dimensions, so->directQuery->dim)));
+		}
+#endif
 	}
 
 	return value;
@@ -461,11 +538,22 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->returnedTidsCount = 0;
 	so->returnedTidsCapacity = 0;
 	so->value = PointerGetDatum(NULL);
+#ifdef IVFFLAT_BENCH
+	so->directL2Eligible = false;
+	so->useDirectL2 = false;
+	so->directQuery = NULL;
+	so->directQueryNeedsFree = false;
+#endif
 
 	/* Set support functions */
 	so->procinfo = index_getprocinfo(index, 1, IVFFLAT_DISTANCE_PROC);
 	so->normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_NORM_PROC);
 	so->collation = index->rd_indcollation[0];
+#ifdef IVFFLAT_BENCH
+	/* Exact function identity also excludes IP, cosine, halfvec, and bit. */
+	so->directL2Eligible =
+		so->procinfo->fn_addr == vector_l2_squared_distance;
+#endif
 
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "Ivfflat scan temporary context",
@@ -517,7 +605,10 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->profile_returned_after_fallback = 0;
 #ifdef IVFFLAT_PROFILE_2B
 	so->profile_distance_calls = so->profile_candidate_extract_ns = 0;
-	so->profile_distance_ns = so->profile_tuple_materialization_ns = 0;
+	so->profile_generic_distance_calls = so->profile_direct_distance_calls = 0;
+	so->profile_tuplesort_input_calls = so->profile_returned_rows = 0;
+	so->profile_distance_ns = so->profile_generic_distance_ns = 0;
+	so->profile_direct_distance_ns = so->profile_tuple_materialization_ns = 0;
 	so->profile_sort_insert_ns = so->profile_sort_finalize_ns = 0;
 	so->profile_scan_items_total_ns = so->profile_max_candidates_per_page = 0;
 	MemSet(so->profile_page_candidates, 0, sizeof(so->profile_page_candidates));
@@ -544,6 +635,13 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 	so->boundedExhausted = false;
 	so->fallbackTriggered = false;
 	so->returnedTidsCount = 0;
+#ifdef IVFFLAT_BENCH
+	if (so->directQueryNeedsFree)
+		pfree(so->directQuery);
+	so->directQuery = NULL;
+	so->directQueryNeedsFree = false;
+	so->useDirectL2 = false;
+#endif
 
 	/* Oracle bound has priority over the automatic limit-aware path */
 	if (so->sortBound > 0)
@@ -704,6 +802,9 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 	else if (so->fallbackTriggered)
 		so->profile_returned_after_fallback++;
+#ifdef IVFFLAT_PROFILE_2B
+	so->profile_returned_rows++;
+#endif
 	return true;
 }
 
@@ -731,9 +832,17 @@ ivfflatendscan(IndexScanDesc scan)
 		 so->profile_sort_us, so->profile_return_us,
 		 so->profile_list_us + so->profile_getitems_us + so->profile_return_us);
 #ifdef IVFFLAT_PROFILE_2B
-	elog(INFO, "IVFFLAT_PROFILE_2B probes=%d dimensions=%d scanned_candidates=%llu scanned_pages=%llu distance_calls=%llu candidate_extract_ns=%llu distance_ns=%llu tuple_materialization_ns=%llu sort_insert_ns=%llu sort_finalize_ns=%llu scan_items_total_ns=%llu page_candidates_0=%llu page_candidates_1=%llu page_candidates_2=%llu page_candidates_3=%llu page_candidates_4plus=%llu max_candidates_per_page=%llu",
-		 so->probes, so->dimensions, (unsigned long long) so->profile_candidates, (unsigned long long) so->profile_pages,
-		 (unsigned long long) so->profile_distance_calls, (unsigned long long) so->profile_candidate_extract_ns,
+	elog(INFO, "IVFFLAT_PROFILE_2B probes=%d dimensions=%d selected_lists=%d scanned_candidates=%llu scanned_pages=%llu distance_calls=%llu tuplesort_input_calls=%llu returned_rows=%llu distance_path_requested=%d direct_l2_eligible=%d direct_l2_active=%d generic_distance_calls=%llu direct_distance_calls=%llu generic_distance_ns=%llu direct_distance_ns=%llu candidate_extract_ns=%llu distance_ns=%llu tuple_materialization_ns=%llu sort_insert_ns=%llu sort_finalize_ns=%llu scan_items_total_ns=%llu page_candidates_0=%llu page_candidates_1=%llu page_candidates_2=%llu page_candidates_3=%llu page_candidates_4plus=%llu max_candidates_per_page=%llu",
+		 so->probes, so->dimensions, so->listIndex,
+		 (unsigned long long) so->profile_candidates, (unsigned long long) so->profile_pages,
+		 (unsigned long long) so->profile_distance_calls, (unsigned long long) so->profile_tuplesort_input_calls,
+		 (unsigned long long) so->profile_returned_rows, ivfflat_distance_path,
+		 so->directL2Eligible ? 1 : 0, so->useDirectL2 ? 1 : 0,
+		 (unsigned long long) so->profile_generic_distance_calls,
+		 (unsigned long long) so->profile_direct_distance_calls,
+		 (unsigned long long) so->profile_generic_distance_ns,
+		 (unsigned long long) so->profile_direct_distance_ns,
+		 (unsigned long long) so->profile_candidate_extract_ns,
 		 (unsigned long long) so->profile_distance_ns, (unsigned long long) so->profile_tuple_materialization_ns,
 		 (unsigned long long) so->profile_sort_insert_ns, (unsigned long long) so->profile_sort_finalize_ns,
 		 (unsigned long long) so->profile_scan_items_total_ns, (unsigned long long) so->profile_page_candidates[0],

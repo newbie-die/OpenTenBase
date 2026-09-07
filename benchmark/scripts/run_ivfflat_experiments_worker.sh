@@ -55,6 +55,10 @@ PHASE2B_WARMUP=${PHASE2B_WARMUP:-100}
 PHASE2B_QUERIES=${PHASE2B_QUERIES:-100}
 PHASE2B_PROBES=${PHASE2B_PROBES:-16,64,128}
 PHASE2B_MODE=${PHASE2B_MODE:-full}
+PHASE2B_DISTANCE_PATH=${PHASE2B_DISTANCE_PATH:-generic}
+PHASE2B_CORRECTNESS_WARMUP=${PHASE2B_CORRECTNESS_WARMUP:-100}
+PHASE2B_CORRECTNESS_QUERIES=${PHASE2B_CORRECTNESS_QUERIES:-100}
+PHASE2B_UNSUPPORTED_QUERIES=${PHASE2B_UNSUPPORTED_QUERIES:-10}
 FORMAL_WARMUP=${FORMAL_WARMUP:-100}
 FORMAL_QUERIES=${FORMAL_QUERIES:-10000}
 FORMAL_PROBES=${FORMAL_PROBES:-1,2,4,8,16,32,64,128,256}
@@ -139,6 +143,14 @@ test -d "${PGDATA}"
     echo "phase2a34_queries=${PHASE2A34_QUERIES}"
     echo "phase2a34_probes=${PHASE2A34_PROBES}"
     echo "phase2a34_filter_divisors=${PHASE2A34_FILTER_DIVISORS}"
+    echo "phase2b_warmup=${PHASE2B_WARMUP}"
+    echo "phase2b_queries=${PHASE2B_QUERIES}"
+    echo "phase2b_probes=${PHASE2B_PROBES}"
+    echo "phase2b_mode=${PHASE2B_MODE}"
+    echo "phase2b_distance_path=${PHASE2B_DISTANCE_PATH}"
+    echo "phase2b_correctness_warmup=${PHASE2B_CORRECTNESS_WARMUP}"
+    echo "phase2b_correctness_queries=${PHASE2B_CORRECTNESS_QUERIES}"
+    echo "phase2b_unsupported_queries=${PHASE2B_UNSUPPORTED_QUERIES}"
     echo "formal_warmup=${FORMAL_WARMUP}"
     echo "formal_queries=${FORMAL_QUERIES}"
     echo "formal_probes=${FORMAL_PROBES}"
@@ -152,7 +164,7 @@ test -d "${PGDATA}"
     "${PYTHON_BIN}" --version
 } >"${RUN_DIR}/environment.txt"
 
-if [[ "${PHASE}" == "2b" ]]; then
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
     PROFILE_CFLAGS="-DIVFFLAT_BENCH -DIVFFLAT_PROFILE_2B"
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
@@ -191,8 +203,8 @@ elif [[ "${PHASE}" == "formal" ]]; then
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; skip index rebuild"
-elif [[ "${PHASE}" == "2b" ]]; then
-    echo "[$(date -u --iso-8601=seconds)] phase 2b reuses existing gist_ivf_l2 index"
+elif [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+    echo "[$(date -u --iso-8601=seconds)] phase ${PHASE} reuses existing IVFFlat indexes"
 else
     echo "[$(date -u --iso-8601=seconds)] build indexes dataset=${BUILD_DATASET}"
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" build \
@@ -228,7 +240,13 @@ if [[ "${PHASE}" == "2b" ]]; then
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run --phase 2b \
         --warmup "${PHASE2B_WARMUP}" --queries "${PHASE2B_QUERIES}" --topk "${TOPK}" \
         --probes-list "${PHASE2B_PROBES}" --mode "${PHASE2B_MODE}" \
-        --output "${RUN_DIR}/phase_2b_profile"
+        --distance-path "${PHASE2B_DISTANCE_PATH}" --output "${RUN_DIR}/phase_2b_profile"
+fi
+if [[ "${PHASE}" == "2b-correctness" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run --phase 2b-correctness \
+        --warmup "${PHASE2B_CORRECTNESS_WARMUP}" --queries "${PHASE2B_CORRECTNESS_QUERIES}" --topk "${TOPK}" \
+        --probes-list 64 --unsupported-queries "${PHASE2B_UNSUPPORTED_QUERIES}" \
+        --output "${RUN_DIR}/phase_2b_direct_correctness"
 fi
 if [[ "${PHASE}" == "formal" ]]; then
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run \

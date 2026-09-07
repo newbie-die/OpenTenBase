@@ -8,6 +8,7 @@ import os
 import random
 import re
 import statistics
+import struct
 import time
 from pathlib import Path
 
@@ -797,6 +798,213 @@ def run_formal(conn, args):
           f"queries_per_config={args.queries} rows={len(rows)}", flush=True)
 
 
+def execute_correctness_query(conn, cur, config, query_literal, topk):
+    conn.notices.clear()
+    sql = (f"SELECT ctid::text, id, embedding {config['operator']} %s::vector "
+           f"FROM {config['table']} "
+           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
+    cur.execute(sql, (query_literal, query_literal, topk))
+    results = [(row[0], int(row[1]), float(row[2])) for row in cur.fetchall()]
+    profile = parse_profile_2b(conn.notices)
+    profile.update(parse_profile(conn.notices))
+    return results, profile
+
+
+def phase2b_correctness_config(conn, args, config, query_literals, mode,
+                                distance_path, query_count):
+    rows = []
+    with conn.cursor() as cur:
+        ensure_index(cur, config)
+        cur.execute("SET enable_indexscan = on")
+        cur.execute("SET enable_seqscan = off")
+        cur.execute("SET ivfflat.iterative_scan = off")
+        cur.execute("SELECT set_config(%s, %s, false)",
+                    ("ivfflat.probes", str(args.probes_list[0])))
+        cur.execute("SELECT set_config(%s, %s, false)",
+                    ("ivfflat.experimental_sort_bound", "0"))
+        cur.execute("SELECT set_config(%s, %s, false)",
+                    ("ivfflat.bounded_scan", "on" if mode == "auto" else "off"))
+        cur.execute("SELECT set_config(%s, %s, false)",
+                    ("ivfflat.bound_overfetch", "4"))
+        cur.execute("SELECT set_config(%s, %s, false)",
+                    ("ivfflat.bound_min", "40"))
+        cur.execute("SELECT set_config(%s, %s, false)",
+                    ("ivfflat.bound_fastpath_limit", "100"))
+        cur.execute("SELECT set_config(%s, %s, false)",
+                    ("ivfflat.distance_path", distance_path))
+        cur.execute("SHOW ivfflat.distance_path")
+        if cur.fetchone()[0] != distance_path:
+            raise RuntimeError("ivfflat.distance_path verification failed")
+
+        for query_literal in query_literals[:args.warmup]:
+            execute_correctness_query(conn, cur, config, query_literal, args.topk)
+        for query_id, query_literal in enumerate(query_literals[:query_count]):
+            results, profile = execute_correctness_query(
+                conn, cur, config, query_literal, args.topk)
+            distances = [result[2] for result in results]
+            rows.append({
+                "dataset": config["table"], "metric": config["metric"],
+                "mode": mode, "distance_path": distance_path,
+                "query_id": query_id,
+                "result_tids": ";".join(result[0] for result in results),
+                "result_ids": ";".join(str(result[1]) for result in results),
+                "result_distances": ";".join(repr(value) for value in distances),
+                "result_distance_bits": ";".join(
+                    struct.pack("!d", value).hex() for value in distances),
+                **profile,
+            })
+    return rows
+
+
+def compare_phase2b_paths(generic_rows, direct_rows, mode, expected_active):
+    generic_by_query = {row["query_id"]: row for row in generic_rows}
+    direct_by_query = {row["query_id"]: row for row in direct_rows}
+    if generic_by_query.keys() != direct_by_query.keys():
+        raise RuntimeError("generic/direct query sets differ")
+
+    counter_fields = (
+        "selected_lists", "scanned_pages", "scanned_candidates",
+        "distance_calls", "tuplesort_input_calls", "returned_rows",
+    )
+    mismatch_counts = {field: 0 for field in counter_fields}
+    fallback_mismatch = 0
+    tid_mismatch = 0
+    id_mismatch = 0
+    differing_distances = 0
+    max_absolute_difference = 0.0
+    max_relative_difference = 0.0
+    active_mismatch = 0
+    dispatch_counter_mismatch = 0
+
+    for query_id in sorted(generic_by_query):
+        generic = generic_by_query[query_id]
+        direct = direct_by_query[query_id]
+        for field in counter_fields:
+            mismatch_counts[field] += int(generic[field] != direct[field])
+        fallback_mismatch += int(
+            generic["fallback_triggered"] != direct["fallback_triggered"])
+        tid_mismatch += int(generic["result_tids"] != direct["result_tids"])
+        id_mismatch += int(generic["result_ids"] != direct["result_ids"])
+        active_mismatch += int(direct["direct_l2_active"] != expected_active)
+
+        generic_dispatch_ok = (
+            generic["generic_distance_calls"] == generic["distance_calls"] and
+            generic["direct_distance_calls"] == 0)
+        if expected_active:
+            direct_dispatch_ok = (
+                direct["direct_distance_calls"] == direct["distance_calls"] and
+                direct["generic_distance_calls"] == 0)
+        else:
+            direct_dispatch_ok = (
+                direct["generic_distance_calls"] == direct["distance_calls"] and
+                direct["direct_distance_calls"] == 0)
+        dispatch_counter_mismatch += int(
+            not generic_dispatch_ok or not direct_dispatch_ok)
+
+        generic_distances = [float(value) for value in
+                             generic["result_distances"].split(";") if value]
+        direct_distances = [float(value) for value in
+                            direct["result_distances"].split(";") if value]
+        if len(generic_distances) != len(direct_distances):
+            differing_distances += abs(
+                len(generic_distances) - len(direct_distances))
+        for generic_distance, direct_distance in zip(
+                generic_distances, direct_distances):
+            if (struct.pack("!d", generic_distance) !=
+                    struct.pack("!d", direct_distance)):
+                differing_distances += 1
+            absolute = abs(generic_distance - direct_distance)
+            denominator = max(abs(generic_distance), abs(direct_distance))
+            relative = absolute / denominator if denominator else 0.0
+            max_absolute_difference = max(max_absolute_difference, absolute)
+            max_relative_difference = max(max_relative_difference, relative)
+
+    return {
+        "mode": mode, "queries": len(generic_by_query),
+        "selected_list_mismatch": mismatch_counts["selected_lists"],
+        "candidate_mismatch": mismatch_counts["scanned_candidates"],
+        "page_mismatch": mismatch_counts["scanned_pages"],
+        "distance_call_mismatch": mismatch_counts["distance_calls"],
+        "tuplesort_input_mismatch":
+            mismatch_counts["tuplesort_input_calls"],
+        "returned_row_mismatch": mismatch_counts["returned_rows"],
+        "tid_mismatch": tid_mismatch, "id_mismatch": id_mismatch,
+        "fallback_mismatch": fallback_mismatch,
+        "differing_distances": differing_distances,
+        "max_absolute_difference": max_absolute_difference,
+        "max_relative_difference": max_relative_difference,
+        "changed_topk_orders": tid_mismatch,
+        "direct_activation_mismatch": active_mismatch,
+        "dispatch_counter_mismatch": dispatch_counter_mismatch,
+    }
+
+
+def run_phase2b_correctness(conn, args):
+    if len(args.probes_list) != 1:
+        raise ValueError("2b-correctness requires exactly one probes value")
+    if args.queries <= 0 or args.unsupported_queries <= 0:
+        raise ValueError("correctness query counts must be positive")
+
+    config = CONFIGS["gist-l2"]
+    load_count = max(args.warmup, args.queries)
+    queries, _ = load_workload(config, load_count, args.topk)
+    query_literals = [vector_literal(query) for query in queries]
+    raw_rows = []
+    summaries = []
+    for mode in ("full", "auto"):
+        generic_rows = phase2b_correctness_config(
+            conn, args, config, query_literals, mode, "generic", args.queries)
+        direct_rows = phase2b_correctness_config(
+            conn, args, config, query_literals, mode, "direct", args.queries)
+        raw_rows.extend(generic_rows)
+        raw_rows.extend(direct_rows)
+        summaries.append(compare_phase2b_paths(
+            generic_rows, direct_rows, mode, expected_active=1))
+
+    unsupported_raw = []
+    unsupported_summaries = []
+    for name in ("glove-ip", "glove-cosine"):
+        unsupported_config = CONFIGS[name]
+        unsupported_load_count = max(args.warmup, args.unsupported_queries)
+        unsupported_queries, _ = load_workload(
+            unsupported_config, unsupported_load_count, args.topk)
+        unsupported_literals = [
+            vector_literal(query) for query in unsupported_queries]
+        generic_rows = phase2b_correctness_config(
+            conn, args, unsupported_config, unsupported_literals,
+            "full", "generic", args.unsupported_queries)
+        direct_rows = phase2b_correctness_config(
+            conn, args, unsupported_config, unsupported_literals,
+            "full", "direct", args.unsupported_queries)
+        unsupported_raw.extend(generic_rows)
+        unsupported_raw.extend(direct_rows)
+        summary = compare_phase2b_paths(
+            generic_rows, direct_rows, name, expected_active=0)
+        summary["metric"] = unsupported_config["metric"]
+        unsupported_summaries.append(summary)
+
+    output = Path(
+        args.output or ROOT / "results/phase_2b_direct_correctness")
+    write_csv(Path(f"{output}_raw.csv"), raw_rows)
+    write_csv(Path(f"{output}_summary.csv"), summaries)
+    write_csv(Path(f"{output}_unsupported_raw.csv"), unsupported_raw)
+    write_csv(
+        Path(f"{output}_unsupported_summary.csv"), unsupported_summaries)
+
+    failure_fields = (
+        "selected_list_mismatch", "candidate_mismatch", "page_mismatch",
+        "distance_call_mismatch", "tuplesort_input_mismatch",
+        "returned_row_mismatch", "tid_mismatch", "id_mismatch",
+        "fallback_mismatch", "differing_distances", "changed_topk_orders",
+        "direct_activation_mismatch", "dispatch_counter_mismatch",
+    )
+    failures = [row for row in summaries + unsupported_summaries
+                if any(row[field] for field in failure_fields)]
+    if failures:
+        raise RuntimeError(
+            f"DIRECT correctness validation failed: {failures}")
+
+
 def run_phase2b(conn, args):
     config = CONFIGS["gist-l2"]
     queries, _ = load_workload(config, max(args.warmup, args.queries), args.topk)
@@ -811,6 +1019,8 @@ def run_phase2b(conn, args):
         cur.execute("SELECT set_config('ivfflat.bound_overfetch', '4', false)")
         cur.execute("SELECT set_config('ivfflat.bound_min', '40', false)")
         cur.execute("SELECT set_config('ivfflat.bound_fastpath_limit', '100', false)")
+        cur.execute("SELECT set_config('ivfflat.distance_path', %s, false)",
+                    (args.distance_path,))
         for probes in args.probes_list:
             cur.execute("SELECT set_config('ivfflat.probes', %s, false)", (str(probes),))
             for query in queries[:args.warmup]:
@@ -820,7 +1030,8 @@ def run_phase2b(conn, args):
                 _, _, profile = execute_query(conn, cur, config, query, args.topk, True)
                 row = parse_profile_2b(conn.notices)
                 row.update(profile)
-                row.update(query_id=query_id, mode=args.mode)
+                row.update(query_id=query_id, mode=args.mode,
+                           distance_path=args.distance_path)
                 raw_rows.append(row)
     summaries = []
     for probes in args.probes_list:
@@ -829,7 +1040,8 @@ def run_phase2b(conn, args):
         pages = total("scanned_pages")
         candidates = total("scanned_candidates")
         scan_ns = total("scan_items_total_ns")
-        summary = {"mode": args.mode, "probes": probes, "queries": len(group),
+        summary = {"mode": args.mode, "distance_path": args.distance_path,
+                   "probes": probes, "queries": len(group),
                    "scanned_pages": pages, "scanned_candidates": candidates,
                    "distance_calls": total("distance_calls"),
                    "avg_pages_per_query": pages / len(group),
@@ -869,6 +1081,8 @@ def run_experiment(args):
             cur.execute("SET client_min_messages = info")
     if args.phase == "formal":
         run_formal(conn, args)
+    elif args.phase == "2b-correctness":
+        run_phase2b_correctness(conn, args)
     elif args.phase == "2b":
         run_phase2b(conn, args)
     elif args.phase == "2a34":
@@ -979,7 +1193,7 @@ def main():
     build.add_argument("--lists", type=int, default=1000)
     build.add_argument("--output", type=Path)
     run = commands.add_parser("run")
-    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "2b", "formal"), required=True)
+    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "2b", "2b-correctness", "formal"), required=True)
     run.add_argument("--dataset", choices=tuple(FORMAL_DATASET_LABELS), default="glove-cosine")
     run.add_argument("--warmup", "--warmup-queries", dest="warmup", type=int, default=100)
     run.add_argument("--queries", type=int, default=1000)
@@ -990,6 +1204,9 @@ def main():
     run.add_argument("--rounds", type=int, default=3)
     run.add_argument("--lists", type=int, default=1000)
     run.add_argument("--mode", choices=("full", "auto"), default="full")
+    run.add_argument("--distance-path", choices=("generic", "direct"),
+                     default="generic")
+    run.add_argument("--unsupported-queries", type=int, default=10)
     run.add_argument("--output", type=Path)
     run.add_argument("--resume", action="store_true")
     run.add_argument("--verify-ground-truth", action="store_true")

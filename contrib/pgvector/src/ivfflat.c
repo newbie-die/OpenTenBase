@@ -29,6 +29,9 @@ bool		ivfflat_bounded_scan;
 int			ivfflat_bound_overfetch;
 int			ivfflat_bound_min;
 int			ivfflat_bound_fastpath_limit;
+#ifdef IVFFLAT_BENCH
+int			ivfflat_distance_path;
+#endif
 static relopt_kind ivfflat_relopt_kind;
 
 static const struct config_enum_entry ivfflat_iterative_scan_options[] = {
@@ -36,6 +39,14 @@ static const struct config_enum_entry ivfflat_iterative_scan_options[] = {
 	{"relaxed_order", IVFFLAT_ITERATIVE_SCAN_RELAXED, false},
 	{NULL, 0, false}
 };
+
+#ifdef IVFFLAT_BENCH
+static const struct config_enum_entry ivfflat_distance_path_options[] = {
+	{"generic", IVFFLAT_DISTANCE_PATH_GENERIC, false},
+	{"direct", IVFFLAT_DISTANCE_PATH_DIRECT, false},
+	{NULL, 0, false}
+};
+#endif
 
 /*
  * Initialize index options and variables
@@ -81,6 +92,14 @@ IvfflatInit(void)
 	DefineCustomIntVariable("ivfflat.bound_fastpath_limit", "Sets the maximum logical bound eligible for limit-aware bounded sorting",
 							 NULL, &ivfflat_bound_fastpath_limit,
 							 100, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+#ifdef IVFFLAT_BENCH
+	DefineCustomEnumVariable("ivfflat.distance_path", "Sets the IVFFlat candidate distance path for benchmarking",
+							 "Direct is used only for the vector L2 support function; all other cases use generic fmgr dispatch.",
+							 &ivfflat_distance_path,
+							 IVFFLAT_DISTANCE_PATH_GENERIC, ivfflat_distance_path_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+#endif
 
 	MarkGUCPrefixReserved("ivfflat");
 }

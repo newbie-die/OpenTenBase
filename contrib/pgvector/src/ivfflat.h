@@ -115,12 +115,23 @@ extern bool ivfflat_bounded_scan;
 extern int	ivfflat_bound_overfetch;
 extern int	ivfflat_bound_min;
 extern int	ivfflat_bound_fastpath_limit;
+#ifdef IVFFLAT_BENCH
+extern int	ivfflat_distance_path;
+#endif
 
 typedef enum IvfflatIterativeScanMode
 {
 	IVFFLAT_ITERATIVE_SCAN_OFF,
 	IVFFLAT_ITERATIVE_SCAN_RELAXED
 }			IvfflatIterativeScanMode;
+
+#ifdef IVFFLAT_BENCH
+typedef enum IvfflatDistancePath
+{
+	IVFFLAT_DISTANCE_PATH_GENERIC,
+	IVFFLAT_DISTANCE_PATH_DIRECT
+}			IvfflatDistancePath;
+#endif
 
 typedef struct VectorArrayData
 {
@@ -297,6 +308,12 @@ typedef struct IvfflatScanOpaqueData
 	bool		first;
 	Datum		value;
 	MemoryContext tmpCtx;
+#ifdef IVFFLAT_BENCH
+	bool		directL2Eligible;
+	bool		useDirectL2;
+	Vector	   *directQuery;
+	bool		directQueryNeedsFree;
+#endif
 
 	/* Sorting */
 	Tuplesortstate *sortstate;
@@ -335,7 +352,10 @@ typedef struct IvfflatScanOpaqueData
 	uint64		profile_returned_after_fallback;
 #ifdef IVFFLAT_PROFILE_2B
 	uint64 profile_distance_calls, profile_candidate_extract_ns;
-	uint64 profile_distance_ns, profile_tuple_materialization_ns;
+	uint64 profile_generic_distance_calls, profile_direct_distance_calls;
+	uint64 profile_tuplesort_input_calls, profile_returned_rows;
+	uint64 profile_distance_ns, profile_generic_distance_ns, profile_direct_distance_ns;
+	uint64 profile_tuple_materialization_ns;
 	uint64 profile_sort_insert_ns, profile_sort_finalize_ns;
 	uint64 profile_scan_items_total_ns;
 	uint64 profile_page_candidates[5], profile_max_candidates_per_page;
