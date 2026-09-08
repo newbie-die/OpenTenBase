@@ -813,6 +813,20 @@ FUSED2_COUNTERS = (
     "fused_pair_calls", "fused_candidates", "single_tail_candidates",
     "fused_fallback_candidates",
 )
+PRODUCTION_PATHS = ("direct", "fused2")
+PRODUCTION_MODES = ("full", "auto")
+PRODUCTION_PROBE_ORDERS = (
+    (16, 64, 128),
+    (128, 64, 16),
+    (64, 16, 128),
+    (64, 128, 16),
+)
+PRODUCTION_RAW_FIELDS = (
+    "experiment", "dataset", "dimension", "metric", "mode", "lists",
+    "probes", "topk", "round", "config_position", "order_position",
+    "distance_path", "query_id", "latency_us", "returned_rows",
+    "result_ids", "result_checksum",
+)
 
 
 def require_check(condition, message):
@@ -1422,6 +1436,272 @@ def run_phase2b(conn, args):
 
 
 
+def production_metric_stats(values):
+    mean = statistics.fmean(values)
+    return {
+        "median": statistics.median(values),
+        "min": min(values),
+        "max": max(values),
+        "variance": statistics.pvariance(values),
+        "cv_pct": 100 * statistics.pstdev(values) / abs(mean) if mean else 0.0,
+        "run_range": max(values) - min(values),
+    }
+
+
+def production_group_stats(rows):
+    latencies = [float(row["latency_us"]) for row in rows]
+    total_seconds = sum(latencies) / 1_000_000.0
+    return {
+        "p50_us": percentile(latencies, 50),
+        "p95_us": percentile(latencies, 95),
+        "p99_us": percentile(latencies, 99),
+        "mean_us": statistics.fmean(latencies),
+        "qps": len(rows) / total_seconds if total_seconds else 0.0,
+        "min_returned_rows": min(int(row["returned_rows"]) for row in rows),
+    }
+
+
+def phase2b_production_schedule(probes_list, rounds):
+    require_check(tuple(sorted(probes_list)) == (16, 64, 128),
+                  "2b-production requires probes=16,64,128")
+    require_check(rounds == 4, "2b-production requires exactly four rounds")
+    schedule = []
+    sequence = 0
+    for round_no in range(1, rounds + 1):
+        probe_order = PRODUCTION_PROBE_ORDERS[round_no - 1]
+        mode_order = PRODUCTION_MODES if round_no % 2 else tuple(reversed(PRODUCTION_MODES))
+        path_order = PRODUCTION_PATHS if round_no % 2 else tuple(reversed(PRODUCTION_PATHS))
+        config_position = 0
+        for probes in probe_order:
+            for mode in mode_order:
+                config_position += 1
+                for order_position, distance_path in enumerate(path_order, start=1):
+                    sequence += 1
+                    schedule.append({
+                        "sequence": sequence, "round": round_no,
+                        "config_position": config_position, "mode": mode,
+                        "probes": probes, "order_position": order_position,
+                        "distance_path": distance_path,
+                    })
+    return schedule
+
+
+def summarize_phase2b_production_run(rows, mode, probes, round_no,
+                                     distance_path, config_position,
+                                     order_position):
+    stats = production_group_stats(rows)
+    result_digest = hashlib.sha256("\n".join(
+        row["result_checksum"] for row in sorted(rows, key=lambda value: value["query_id"])
+    ).encode()).hexdigest()
+    return {
+        "mode": mode, "probes": probes, "round": round_no,
+        "config_position": config_position, "order_position": order_position,
+        "distance_path": distance_path, "queries": len(rows), **stats,
+        "result_checksum": result_digest,
+    }
+
+
+def compare_phase2b_production_pair(direct, fused, raw_rows):
+    require_check((direct["mode"], direct["probes"], direct["round"]) ==
+                  (fused["mode"], fused["probes"], fused["round"]),
+                  "production pair configuration mismatch")
+    matching = [
+        row for row in raw_rows
+        if row["mode"] == direct["mode"] and row["probes"] == direct["probes"] and
+        row["round"] == direct["round"]
+    ]
+    by_path = {
+        path: {row["query_id"]: row for row in matching if row["distance_path"] == path}
+        for path in PRODUCTION_PATHS
+    }
+    require_check(set(by_path["direct"]) == set(by_path["fused2"]),
+                  "production pair query IDs differ")
+    query_ids = sorted(by_path["direct"])
+    result_mismatches = sum(
+        by_path["direct"][query_id]["result_checksum"] !=
+        by_path["fused2"][query_id]["result_checksum"]
+        for query_id in query_ids)
+    returned_mismatches = sum(
+        by_path["direct"][query_id]["returned_rows"] !=
+        by_path["fused2"][query_id]["returned_rows"]
+        for query_id in query_ids)
+    pair = {
+        "mode": direct["mode"], "probes": direct["probes"],
+        "round": direct["round"], "queries": len(query_ids),
+        "order": "-".join(row["distance_path"] for row in
+                            sorted((direct, fused), key=lambda row: row["order_position"])),
+        "result_mismatch_queries": result_mismatches,
+        "returned_row_mismatch_queries": returned_mismatches,
+        "all_result_checksums_equal": result_mismatches == 0,
+        "all_returned_rows_equal": returned_mismatches == 0,
+    }
+    for metric in ("p50_us", "p95_us", "p99_us", "mean_us"):
+        direct_value = direct[metric]
+        fused_value = fused[metric]
+        pair[f"direct_{metric}"] = direct_value
+        pair[f"fused2_{metric}"] = fused_value
+        pair[f"paired_{metric[:-3]}_improvement_pct"] = (
+            100 * (direct_value - fused_value) / direct_value)
+    pair["direct_qps"] = direct["qps"]
+    pair["fused2_qps"] = fused["qps"]
+    pair["paired_qps_improvement_pct"] = (
+        100 * (fused["qps"] - direct["qps"]) / direct["qps"])
+    pair["direct_min_returned_rows"] = direct["min_returned_rows"]
+    pair["fused2_min_returned_rows"] = fused["min_returned_rows"]
+    return pair
+
+
+def summarize_phase2b_production(pairs):
+    output = []
+    for mode, probes in sorted({(row["mode"], row["probes"]) for row in pairs}):
+        group = [row for row in pairs if row["mode"] == mode and row["probes"] == probes]
+        result = {
+            "mode": mode, "probes": probes, "rounds": len(group),
+            "queries_per_path_per_round": group[0]["queries"],
+            "result_mismatch_queries": sum(row["result_mismatch_queries"] for row in group),
+            "returned_row_mismatch_queries": sum(
+                row["returned_row_mismatch_queries"] for row in group),
+            "all_result_checksums_equal": all(row["all_result_checksums_equal"] for row in group),
+            "all_returned_rows_equal": all(row["all_returned_rows_equal"] for row in group),
+        }
+        for metric in ("p50", "p95", "p99", "mean"):
+            for distance_path in PRODUCTION_PATHS:
+                values = [row[f"{distance_path}_{metric}_us"] for row in group]
+                for stat, value in production_metric_stats(values).items():
+                    result[f"{distance_path}_{metric}_us_{stat}"] = value
+        for distance_path in PRODUCTION_PATHS:
+            values = [row[f"{distance_path}_qps"] for row in group]
+            for stat, value in production_metric_stats(values).items():
+                result[f"{distance_path}_qps_{stat}"] = value
+        for metric in ("p50", "p95", "p99", "mean", "qps"):
+            values = [row[f"paired_{metric}_improvement_pct"] for row in group]
+            for stat, value in production_metric_stats(values).items():
+                result[f"paired_{metric}_improvement_pct_{stat}"] = value
+            result[f"paired_{metric}_positive_rounds"] = sum(value > 0 for value in values)
+        output.append(result)
+    return output
+
+
+def verify_phase2b_production_build(conn, args, config, query_literal):
+    sql = (f"SELECT id FROM {config['table']} "
+           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
+    with conn.cursor() as cur:
+        configure_phase2b_scan(cur, args.probes_list[0], "full", "direct")
+        cur.execute("SET client_min_messages = info")
+        conn.notices.clear()
+        try:
+            formal_query(cur, sql, query_literal, args.topk)
+            profiling = [notice for notice in conn.notices
+                         if PROFILE_RE.search(notice) or PROFILE_2B_RE.search(notice)]
+            require_check(not profiling,
+                          "2b-production build contains IVFFlat profiling notices")
+        finally:
+            conn.notices.clear()
+            cur.execute("RESET client_min_messages")
+    print("2b-production build check: distance_path available; profiling notices off",
+          flush=True)
+
+
+def run_phase2b_production(conn, args):
+    require_check(args.lists == 1000 and args.topk == 10,
+                  "2b-production requires lists=1000 and topk=10")
+    require_check(args.baseline_path == "direct" and args.test_path == "fused2",
+                  "2b-production requires direct/fused2")
+    require_check(args.mode == "both", "2b-production requires mode=both")
+    require_check(args.warmup == 100 and args.queries == 1000,
+                  "2b-production requires warmup=100 and queries=1000")
+    schedule = phase2b_production_schedule(args.probes_list, args.rounds)
+    config = CONFIGS["gist-l2"]
+    queries, _ = load_workload(config, max(args.warmup, args.queries), args.topk)
+    require_check(len(queries) >= args.queries, "insufficient GIST1M official queries")
+    query_literals = [vector_literal(query) for query in queries]
+    verify_phase2b_production_build(conn, args, config, query_literals[0])
+
+    output = Path(args.output or ROOT / "results/phase_2b_fused2_production")
+    raw_path = Path(f"{output}_raw.csv")
+    runs_path = Path(f"{output}_runs.csv")
+    paired_path = Path(f"{output}_paired.csv")
+    summary_path = Path(f"{output}_summary.csv")
+    run_order_path = output.parent / "run_order.txt"
+    for path in (raw_path, runs_path, paired_path, summary_path, run_order_path):
+        require_check(not path.exists(), f"production output already exists: {path}")
+    run_order_path.write_text("")
+
+    raw_rows = []
+    run_rows = []
+    pairs = []
+    sql = (f"SELECT id FROM {config['table']} "
+           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
+    grouped_schedule = {}
+    for entry in schedule:
+        grouped_schedule.setdefault(
+            (entry["round"], entry["config_position"], entry["mode"], entry["probes"]),
+            []).append(entry)
+
+    with conn.cursor() as cur:
+        ensure_index(cur, config)
+        for key, entries in grouped_schedule.items():
+            round_no, config_position, mode, probes = key
+            for entry in entries:
+                distance_path = entry["distance_path"]
+                with run_order_path.open("a") as run_order:
+                    run_order.write(
+                        f"{entry['sequence']}: round={round_no} config={config_position} "
+                        f"mode={mode} probes={probes} order={entry['order_position']} "
+                        f"path={distance_path}\n")
+                print(
+                    f"2b-production round={round_no} config={config_position} "
+                    f"mode={mode} probes={probes} order={entry['order_position']} "
+                    f"path={distance_path} warmup={args.warmup} queries={args.queries}",
+                    flush=True)
+                configure_phase2b_scan(cur, probes, mode, distance_path)
+                for query_literal in query_literals[:args.warmup]:
+                    formal_query(cur, sql, query_literal, args.topk)
+                path_rows = []
+                for query_id, query_literal in enumerate(query_literals[:args.queries]):
+                    ids, latency_us = formal_query(cur, sql, query_literal, args.topk)
+                    result_ids = ";".join(str(value) for value in ids)
+                    row = {
+                        "experiment": "phase_2b_fused2_production",
+                        "dataset": "gist1m", "dimension": config["dimension"],
+                        "metric": config["metric"], "mode": mode,
+                        "lists": args.lists, "probes": probes, "topk": args.topk,
+                        "round": round_no, "config_position": config_position,
+                        "order_position": entry["order_position"],
+                        "distance_path": distance_path, "query_id": query_id,
+                        "latency_us": latency_us, "returned_rows": len(ids),
+                        "result_ids": result_ids,
+                        "result_checksum": hashlib.sha256(result_ids.encode()).hexdigest(),
+                    }
+                    path_rows.append(row)
+                    raw_rows.append(row)
+                run_rows.append(summarize_phase2b_production_run(
+                    path_rows, mode, probes, round_no, distance_path,
+                    config_position, entry["order_position"]))
+                write_csv_atomic(raw_path, raw_rows, PRODUCTION_RAW_FIELDS)
+                write_csv_atomic(runs_path, run_rows, tuple(run_rows[0].keys()))
+
+            direct = next(row for row in run_rows if row["mode"] == mode and
+                          row["probes"] == probes and row["round"] == round_no and
+                          row["distance_path"] == "direct")
+            fused = next(row for row in run_rows if row["mode"] == mode and
+                         row["probes"] == probes and row["round"] == round_no and
+                         row["distance_path"] == "fused2")
+            pair = compare_phase2b_production_pair(direct, fused, raw_rows)
+            pairs.append(pair)
+            write_csv_atomic(paired_path, pairs, tuple(pairs[0].keys()))
+            require_check(pair["result_mismatch_queries"] == 0 and
+                          pair["returned_row_mismatch_queries"] == 0,
+                          f"invalid production config: {pair}")
+
+    summaries = summarize_phase2b_production(pairs)
+    write_csv_atomic(summary_path, summaries, tuple(summaries[0].keys()))
+    require_check(len(raw_rows) == 3 * 2 * 2 * 4 * args.queries,
+                  "unexpected production raw row count")
+    print(f"2b-production complete rows={len(raw_rows)} paired_rounds={len(pairs)}",
+          flush=True)
+
+
 
 def run_experiment(args):
     conn = connect(args)
@@ -1431,6 +1711,8 @@ def run_experiment(args):
             cur.execute("SET client_min_messages = info")
     if args.phase == "formal":
         run_formal(conn, args)
+    elif args.phase == "2b-production":
+        run_phase2b_production(conn, args)
     elif args.phase == "2b-correctness":
         run_phase2b_correctness(conn, args)
     elif args.phase == "2b":
@@ -1532,7 +1814,7 @@ def build_indexes(args):
 
 
 def validate_phase2b_options(args):
-    if args.phase not in ("2b", "2b-correctness"):
+    if args.phase not in ("2b", "2b-correctness", "2b-production"):
         if args.check_fused2_edges:
             raise ValueError("--check-fused2-edges is only supported by 2b-correctness")
         return
@@ -1540,10 +1822,20 @@ def validate_phase2b_options(args):
         raise ValueError("queries/topk/lists must be positive; warmup must be nonnegative")
     if not args.probes_list or any(p <= 0 or p > args.lists for p in args.probes_list):
         raise ValueError("probes must be between 1 and lists")
-    paired = args.phase == "2b-correctness" or args.distance_path == "interleaved"
+    paired = args.phase in ("2b-correctness", "2b-production") or args.distance_path == "interleaved"
     if paired and args.baseline_path == args.test_path:
         raise ValueError("baseline-path and test-path must differ")
-    if args.phase == "2b-correctness":
+    if args.phase == "2b-production":
+        phase2b_production_schedule(args.probes_list, args.rounds)
+        if (args.baseline_path, args.test_path, args.mode, args.distance_path) != (
+                "direct", "fused2", "both", "interleaved"):
+            raise ValueError(
+                "2b-production requires direct/fused2, mode=both, distance-path=interleaved")
+        if args.check_fused2_edges:
+            raise ValueError("2b-production does not run fused2 edge checks")
+        if args.queries != 1000 or args.warmup != 100 or args.topk != 10 or args.lists != 1000:
+            raise ValueError("2b-production requires queries=1000, warmup=100, topk=10, lists=1000")
+    elif args.phase == "2b-correctness":
         if len(args.probes_list) != 1 or args.unsupported_queries <= 0:
             raise ValueError("correctness requires one probes value and positive unsupported-queries")
     elif args.rounds <= 0 or args.check_fused2_edges:
@@ -1564,7 +1856,7 @@ def main():
     build.add_argument("--lists", type=int, default=1000)
     build.add_argument("--output", type=Path)
     run = commands.add_parser("run")
-    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "2b", "2b-correctness", "formal"), required=True)
+    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "2b", "2b-correctness", "2b-production", "formal"), required=True)
     run.add_argument("--dataset", choices=tuple(FORMAL_DATASET_LABELS), default="glove-cosine")
     run.add_argument("--warmup", "--warmup-queries", dest="warmup", type=int, default=100)
     run.add_argument("--queries", type=int, default=1000)

@@ -17,8 +17,8 @@ if [[ $# -gt 0 ]]; then
     shift
 fi
 
-if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "formal" ]]; then
-    echo "usage: $0 [all|a|b|2a|2a2|2a34|2b|2b-correctness|formal] [phase options]" >&2
+if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && "${PHASE}" != "formal" ]]; then
+    echo "usage: $0 [all|a|b|2a|2a2|2a34|2b|2b-correctness|2b-production|formal] [phase options]" >&2
     exit 2
 fi
 
@@ -38,8 +38,8 @@ while [[ $# -gt 0 ]]; do
         shift
     fi
 done
-if [[ "${PHASE}" != "formal" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && ${#WORKER_ARGS[@]} -gt 0 ]]; then
-    echo "additional CLI options are supported only for formal, 2b and 2b-correctness" >&2
+if [[ "${PHASE}" != "formal" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && ${#WORKER_ARGS[@]} -gt 0 ]]; then
+    echo "additional CLI options are supported only for formal and Phase 2B modes" >&2
     exit 2
 fi
 

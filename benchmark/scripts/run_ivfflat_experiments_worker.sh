@@ -14,11 +14,11 @@ for argument in "${FORMAL_ARGS[@]}"; do
         FORMAL_RESUME=1
     fi
 done
-if [[ "${PHASE}" != "formal" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && ${#PHASE_ARGS[@]} -gt 0 ]]; then
-    echo "additional CLI options are supported only for formal, 2b and 2b-correctness" >&2
+if [[ "${PHASE}" != "formal" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && ${#PHASE_ARGS[@]} -gt 0 ]]; then
+    echo "additional CLI options are supported only for formal and Phase 2B modes" >&2
     exit 2
 fi
-if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-production" ]]; then
     for argument in "${PHASE_ARGS[@]}"; do
         case "${argument}" in
             --phase|--phase=*|--output|--output=*|--resume|--validate-only)
@@ -75,6 +75,10 @@ PHASE2B_OPTFLAGS=${PHASE2B_OPTFLAGS:-"-march=haswell -mtune=haswell -mavx2 -mfma
 PHASE2B_CORRECTNESS_WARMUP=${PHASE2B_CORRECTNESS_WARMUP:-100}
 PHASE2B_CORRECTNESS_QUERIES=${PHASE2B_CORRECTNESS_QUERIES:-100}
 PHASE2B_UNSUPPORTED_QUERIES=${PHASE2B_UNSUPPORTED_QUERIES:-10}
+PHASE2B_PRODUCTION_WARMUP=${PHASE2B_PRODUCTION_WARMUP:-100}
+PHASE2B_PRODUCTION_QUERIES=${PHASE2B_PRODUCTION_QUERIES:-1000}
+PHASE2B_PRODUCTION_PROBES=${PHASE2B_PRODUCTION_PROBES:-16,64,128}
+PHASE2B_PRODUCTION_ROUNDS=${PHASE2B_PRODUCTION_ROUNDS:-4}
 FORMAL_WARMUP=${FORMAL_WARMUP:-100}
 FORMAL_QUERIES=${FORMAL_QUERIES:-10000}
 FORMAL_PROBES=${FORMAL_PROBES:-1,2,4,8,16,32,64,128,256}
@@ -175,6 +179,10 @@ test -d "${PGDATA}"
     echo "phase2b_correctness_warmup=${PHASE2B_CORRECTNESS_WARMUP}"
     echo "phase2b_correctness_queries=${PHASE2B_CORRECTNESS_QUERIES}"
     echo "phase2b_unsupported_queries=${PHASE2B_UNSUPPORTED_QUERIES}"
+    echo "phase2b_production_warmup=${PHASE2B_PRODUCTION_WARMUP}"
+    echo "phase2b_production_queries=${PHASE2B_PRODUCTION_QUERIES}"
+    echo "phase2b_production_probes=${PHASE2B_PRODUCTION_PROBES}"
+    echo "phase2b_production_rounds=${PHASE2B_PRODUCTION_ROUNDS}"
     echo "formal_warmup=${FORMAL_WARMUP}"
     echo "formal_queries=${FORMAL_QUERIES}"
     echo "formal_probes=${FORMAL_PROBES}"
@@ -190,7 +198,7 @@ test -d "${PGDATA}"
 
 COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
 PHASE2B_RUN_ARGS=()
-if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-production" ]]; then
     PHASE2B_EFFECTIVE_BASELINE_PATH=${PHASE2B_BASELINE_PATH}
     PHASE2B_EFFECTIVE_TEST_PATH=${PHASE2B_TEST_PATH}
     for ((phase_arg_index = 0; phase_arg_index < ${#PHASE_ARGS[@]}; phase_arg_index++)); do
@@ -219,6 +227,14 @@ if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
                           --probes-list "${PHASE2B_PROBES}" --mode "${PHASE2B_MODE}"
                           --distance-path "${PHASE2B_DISTANCE_PATH}" --rounds "${PHASE2B_ROUNDS}"
                           --output "${RUN_DIR}/${PHASE2B_OUTPUT_NAME}")
+    elif [[ "${PHASE}" == "2b-production" ]]; then
+        PHASE2B_RUN_ARGS=(--phase "${PHASE}" --baseline-path direct --test-path fused2
+                          --topk "${TOPK}" --lists "${LISTS}"
+                          --warmup "${PHASE2B_PRODUCTION_WARMUP}"
+                          --queries "${PHASE2B_PRODUCTION_QUERIES}"
+                          --probes-list "${PHASE2B_PRODUCTION_PROBES}" --mode both
+                          --distance-path interleaved --rounds "${PHASE2B_PRODUCTION_ROUNDS}"
+                          --output "${RUN_DIR}/phase_2b_fused2_production")
     else
         PHASE2B_RUN_ARGS+=(--warmup "${PHASE2B_CORRECTNESS_WARMUP}" --queries "${PHASE2B_CORRECTNESS_QUERIES}"
                           --probes-list 64 --unsupported-queries "${PHASE2B_UNSUPPORTED_QUERIES}"
@@ -237,6 +253,9 @@ PROFILE_BUILD_ARGS=()
 if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
     PROFILE_CFLAGS="-DIVFFLAT_BENCH -DIVFFLAT_PROFILE_2B"
     PROFILE_BUILD_ARGS=(OPTFLAGS="${PHASE2B_OPTFLAGS}")
+elif [[ "${PHASE}" == "2b-production" ]]; then
+    PROFILE_CFLAGS="-DIVFFLAT_FUSED2"
+    PROFILE_BUILD_ARGS=(OPTFLAGS="${PHASE2B_OPTFLAGS}")
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; keep installed build and index"
@@ -247,10 +266,32 @@ else
         echo "[$(date -u --iso-8601=seconds)] install production pgvector"
         env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}"
     else
-        echo "[$(date -u --iso-8601=seconds)] build pgvector with IVFFLAT_BENCH"
-        env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}" "${PROFILE_BUILD_ARGS[@]}"
+        if [[ "${PHASE}" == "2b-production" ]]; then
+            echo "[$(date -u --iso-8601=seconds)] build pgvector with FUSED2 path switch and no profiling"
+            env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS}" "${PROFILE_BUILD_ARGS[@]}" 2>&1 | tee "${RUN_DIR}/build.log"
+        else
+            echo "[$(date -u --iso-8601=seconds)] build pgvector with IVFFLAT_BENCH"
+            env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" -B PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}" "${PROFILE_BUILD_ARGS[@]}"
+        fi
         echo "[$(date -u --iso-8601=seconds)] install pgvector"
         env -u PG_CFLAGS make -C "${PGVECTOR_ROOT}" install PG_CONFIG="${PG_CONFIG}" IVFFLAT_PROFILE_CFLAGS="${PROFILE_CFLAGS:--DIVFFLAT_BENCH}" "${PROFILE_BUILD_ARGS[@]}"
+        if [[ "${PHASE}" == "2b-production" ]]; then
+            grep -E "(^|[[:space:]])(gcc|cc|clang).*src/(vector|ivfscan)\\.c" "${RUN_DIR}/build.log" >"${RUN_DIR}/compile_command.txt"
+            if grep -q -- "-DIVFFLAT_PROFILE_2B\|-DIVFFLAT_BENCH" "${RUN_DIR}/compile_command.txt"; then
+                echo "production compile command contains profiling macro" >&2
+                exit 1
+            fi
+            "${CC:-cc}" --version >"${RUN_DIR}/compiler_version.txt"
+            INSTALLED_VECTOR_SO=${PGVECTOR_INSTALLED_SO:-"$("${PG_CONFIG}" --pkglibdir)/vector.so"}
+            test -f "${INSTALLED_VECTOR_SO}"
+            sha256sum "${INSTALLED_VECTOR_SO}" >"${RUN_DIR}/vector.so.sha256"
+            mkdir -p "${RUN_DIR}/assembly"
+            objdump -d -M intel "${INSTALLED_VECTOR_SO}" >"${RUN_DIR}/assembly/vector.so.asm"
+            if strings "${INSTALLED_VECTOR_SO}" | grep -q "IVFFLAT_PROFILE"; then
+                echo "production vector.so contains profiling NOTICE strings" >&2
+                exit 1
+            fi
+        fi
     fi
     echo "[$(date -u --iso-8601=seconds)] restart PostgreSQL as ${PG_OS_USER}"
     if [[ "$(id -un)" == "${PG_OS_USER}" ]]; then
@@ -273,7 +314,7 @@ elif [[ "${PHASE}" == "formal" ]]; then
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; skip index rebuild"
-elif [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+elif [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-production" ]]; then
     echo "[$(date -u --iso-8601=seconds)] phase ${PHASE} reuses existing IVFFlat indexes"
 else
     echo "[$(date -u --iso-8601=seconds)] build indexes dataset=${BUILD_DATASET}"
@@ -306,7 +347,7 @@ if [[ "${PHASE}" == "2a34" ]]; then
         --probes-list "${PHASE2A34_PROBES}" --filter-divisors "${PHASE2A34_FILTER_DIVISORS}" --lists "${LISTS}" \
         --output "${RUN_DIR}/phase_2a34_robustness"
 fi
-if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-production" ]]; then
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${PHASE2B_RUN_ARGS[@]}"
 fi
 if [[ "${PHASE}" == "formal" ]]; then

@@ -82,6 +82,47 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(summary['direct_ns_per_candidate_median'], 10)
 
 
+    def test_production_schedule_rotates_and_interleaves(self):
+        schedule = b.phase2b_production_schedule((16, 64, 128), 4)
+        self.assertEqual(len(schedule), 48)
+        for round_no, expected_probes in enumerate(b.PRODUCTION_PROBE_ORDERS, start=1):
+            rows = [entry for entry in schedule if entry['round'] == round_no]
+            actual_probes = []
+            for entry in rows:
+                if entry['probes'] not in actual_probes:
+                    actual_probes.append(entry['probes'])
+            self.assertEqual(tuple(actual_probes), expected_probes)
+            expected_paths = ('direct', 'fused2') if round_no % 2 else ('fused2', 'direct')
+            for position in range(0, len(rows), 2):
+                self.assertEqual(tuple(entry['distance_path']
+                                       for entry in rows[position:position + 2]),
+                                 expected_paths)
+
+    def test_production_pair_checks_results_and_statistics(self):
+        raw = []
+        runs = []
+        for distance_path, order, latencies, ids in [
+                ('direct', 1, (100.0, 200.0), ('1;2', '3;4')),
+                ('fused2', 2, (80.0, 160.0), ('1;2', '3;4'))]:
+            path_rows = []
+            for query_id, (latency, result_ids) in enumerate(zip(latencies, ids)):
+                item = {
+                    'mode': 'full', 'probes': 64, 'round': 1,
+                    'distance_path': distance_path, 'query_id': query_id,
+                    'latency_us': latency, 'returned_rows': 2,
+                    'result_checksum': result_ids,
+                }
+                path_rows.append(item)
+                raw.append(item)
+            runs.append(b.summarize_phase2b_production_run(
+                path_rows, 'full', 64, 1, distance_path, 1, order))
+        pair = b.compare_phase2b_production_pair(runs[0], runs[1], raw)
+        self.assertEqual(pair['result_mismatch_queries'], 0)
+        self.assertAlmostEqual(pair['paired_p50_improvement_pct'], 20.0)
+        summary = b.summarize_phase2b_production([pair])
+        self.assertEqual(summary[0]['paired_p50_positive_rounds'], 1)
+
+
 class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -98,17 +139,23 @@ with open(os.environ['MOCK_CALLS'], 'a') as f:
     f.write(json.dumps([name, *sys.argv[1:]]) + '\\n')
 if name == 'python' and '--validate-only' in sys.argv:
     raise SystemExit(subprocess.call([sys.executable, *sys.argv[1:]]))
-print('mock ' + name)
+if name == 'make':
+    print('gcc -O2 -g -march=haswell -mtune=haswell -mavx2 -mfma -DIVFFLAT_FUSED2 -c -o src/vector.o src/vector.c')
+else:
+    print('mock ' + name)
 ''')
         mock.chmod(0o755)
-        for name in ['python', 'make', 'pg_config', 'pg_ctl']:
+        for name in ['python', 'make', 'pg_config', 'pg_ctl', 'objdump', 'strings']:
             (self.root / 'bin' / name).symlink_to(mock)
+        self.vector_so = self.root / 'vector.so'
+        self.vector_so.write_bytes(b'mock vector')
         self.env = dict(os.environ, PATH=str(self.root / 'bin') + ':' + os.environ['PATH'],
                         PYTHON_BIN=str(self.root / 'bin/python'),
                         PG_CONFIG=str(self.root / 'bin/pg_config'), PG_CTL=str(self.root / 'bin/pg_ctl'),
                         PGDATA=str(self.root / 'pgdata'), PG_OS_USER=pwd.getpwuid(os.getuid()).pw_name,
                         RUN_DIR=str(self.root / 'run'), PID_FILE=str(self.root / 'pid'),
-                        MOCK_CALLS=str(self.log), INSTALL_DEPS='0')
+                        MOCK_CALLS=str(self.log), INSTALL_DEPS='0',
+                        PGVECTOR_INSTALLED_SO=str(self.vector_so))
 
     def run_worker(self, *args):
         return subprocess.run(['bash', str(ROOT / 'benchmark/scripts/run_ivfflat_experiments_worker.sh'), *args],
@@ -127,6 +174,7 @@ print('mock ' + name)
         self.assertLess(validation, build)
         self.assertIn('OPTFLAGS=-march=haswell -mtune=haswell -mavx2 -mfma', calls[build])
         final = [c for c in calls if c[0] == 'python' and 'run' in c][-1]
+        self.assertTrue(any('phase_2b_correctness' in value for value in final))
         self.assertEqual(final[-9:], ['--baseline-path', 'direct', '--test-path', 'fused2',
                                       '--check-fused2-edges', '--queries', '3', '--warmup', '0'])
         self.assertEqual((self.root / 'run/status').read_text().strip(), 'complete')
@@ -150,6 +198,29 @@ print('mock ' + name)
         final = [c for c in self.calls() if c[0] == 'python' and 'run' in c][-1]
         self.assertEqual(final[-8:], ['--baseline-path', 'direct', '--test-path', 'fused2',
                                       '--queries', '3', '--warmup', '0'])
+
+
+    def test_profile_cli_paths_select_fused2_output_name(self):
+        r = self.run_worker('2b', '--distance-path', 'interleaved',
+                            '--baseline-path', 'direct', '--test-path', 'fused2',
+                            '--queries', '3', '--warmup', '0', '--rounds', '1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        final = [c for c in self.calls() if c[0] == 'python' and 'run' in c][-1]
+        output = final[final.index('--output') + 1]
+        self.assertTrue(output.endswith('/phase_2b_fused2'), output)
+
+    def test_production_build_has_switch_without_profiling(self):
+        r = self.run_worker('2b-production')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        compile_command = (self.root / 'run/compile_command.txt').read_text()
+        self.assertIn('-DIVFFLAT_FUSED2', compile_command)
+        self.assertNotIn('-DIVFFLAT_BENCH', compile_command)
+        self.assertNotIn('-DIVFFLAT_PROFILE_2B', compile_command)
+        final = [call for call in self.calls()
+                 if call[0] == 'python' and 'run' in call][-1]
+        self.assertEqual(final[final.index('--phase') + 1], '2b-production')
+        self.assertTrue(final[final.index('--output') + 1].endswith(
+            '/phase_2b_fused2_production'))
 
     def test_invalid_path_rejected_before_build(self):
         r = self.run_worker('2b-correctness', '--test-path', 'invalid')
