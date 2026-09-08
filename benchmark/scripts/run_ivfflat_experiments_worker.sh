@@ -191,13 +191,34 @@ test -d "${PGDATA}"
 COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
 PHASE2B_RUN_ARGS=()
 if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+    PHASE2B_EFFECTIVE_BASELINE_PATH=${PHASE2B_BASELINE_PATH}
+    PHASE2B_EFFECTIVE_TEST_PATH=${PHASE2B_TEST_PATH}
+    for ((phase_arg_index = 0; phase_arg_index < ${#PHASE_ARGS[@]}; phase_arg_index++)); do
+        argument=${PHASE_ARGS[phase_arg_index]}
+        case "${argument}" in
+            --baseline-path=*) PHASE2B_EFFECTIVE_BASELINE_PATH=${argument#*=} ;;
+            --test-path=*) PHASE2B_EFFECTIVE_TEST_PATH=${argument#*=} ;;
+            --baseline-path)
+                if ((phase_arg_index + 1 < ${#PHASE_ARGS[@]})); then
+                    PHASE2B_EFFECTIVE_BASELINE_PATH=${PHASE_ARGS[phase_arg_index + 1]}
+                fi ;;
+            --test-path)
+                if ((phase_arg_index + 1 < ${#PHASE_ARGS[@]})); then
+                    PHASE2B_EFFECTIVE_TEST_PATH=${PHASE_ARGS[phase_arg_index + 1]}
+                fi ;;
+        esac
+    done
     PHASE2B_RUN_ARGS=(--phase "${PHASE}" --baseline-path "${PHASE2B_BASELINE_PATH}"
                      --test-path "${PHASE2B_TEST_PATH}" --topk "${TOPK}" --lists "${LISTS}")
     if [[ "${PHASE}" == "2b" ]]; then
+        PHASE2B_OUTPUT_NAME=phase_2b_profile
+        if [[ "${PHASE2B_EFFECTIVE_BASELINE_PATH}" == "direct" && "${PHASE2B_EFFECTIVE_TEST_PATH}" == "fused2" ]]; then
+            PHASE2B_OUTPUT_NAME=phase_2b_fused2
+        fi
         PHASE2B_RUN_ARGS+=(--warmup "${PHASE2B_WARMUP}" --queries "${PHASE2B_QUERIES}"
                           --probes-list "${PHASE2B_PROBES}" --mode "${PHASE2B_MODE}"
                           --distance-path "${PHASE2B_DISTANCE_PATH}" --rounds "${PHASE2B_ROUNDS}"
-                          --output "${RUN_DIR}/phase_2b_profile")
+                          --output "${RUN_DIR}/${PHASE2B_OUTPUT_NAME}")
     else
         PHASE2B_RUN_ARGS+=(--warmup "${PHASE2B_CORRECTNESS_WARMUP}" --queries "${PHASE2B_CORRECTNESS_QUERIES}"
                           --probes-list 64 --unsupported-queries "${PHASE2B_UNSUPPORTED_QUERIES}"

@@ -1151,6 +1151,7 @@ def summarize_phase2b_path(rows, mode, probes, round_no, distance_path,
         "direct_distance_ns": total("direct_distance_ns"),
         "distance_ns": total("distance_ns"),
         "distance_ns_per_candidate": total(path_ns_key) / candidates,
+        "scan_items_ns_per_query": scan_ns / len(rows),
         "candidate_extract_ns": total("candidate_extract_ns"),
         "tuple_materialization_ns": total("tuple_materialization_ns"),
         "sort_insert_ns": total("sort_insert_ns"),
@@ -1168,6 +1169,11 @@ def summarize_phase2b_path(rows, mode, probes, round_no, distance_path,
     for key in FUSED2_COUNTERS + ("fused_distance_ns",):
         result[key] = sum(row.get(key, 0) for row in rows)
     result["fused_coverage_pct"] = 100 * result["fused_candidates"] / candidates
+    result["direct_tail_distance_ns"] = (
+        result["direct_distance_ns"] if distance_path == "fused2" else 0)
+    result["fused_distance_ns_per_pair"] = (
+        result["fused_distance_ns"] / result["fused_pair_calls"]
+        if result["fused_pair_calls"] else 0.0)
     return result
 
 
@@ -1207,6 +1213,8 @@ def compare_phase2b_profile_pair(baseline, test):
         "test_distance_improvement_pct": 100 * saved_ns / baseline_ns,
         "baseline_scan_items_total_ns": baseline["scan_items_total_ns"],
         "test_scan_items_total_ns": test["scan_items_total_ns"],
+        "baseline_scan_items_ns_per_query": baseline["scan_items_ns_per_query"],
+        "test_scan_items_ns_per_query": test["scan_items_ns_per_query"],
         "baseline_candidate_extract_ns": baseline["candidate_extract_ns"],
         "test_candidate_extract_ns": test["candidate_extract_ns"],
         "baseline_sort_insert_ns": baseline["sort_insert_ns"],
@@ -1217,6 +1225,14 @@ def compare_phase2b_profile_pair(baseline, test):
 
     result["scan_items_speedup"] = baseline["scan_items_total_ns"] / test["scan_items_total_ns"]
     result["scan_items_improvement_pct"] = 100 * (1 - test["scan_items_total_ns"] / baseline["scan_items_total_ns"])
+    result["fused_coverage_pct"] = test["fused_coverage_pct"]
+    result["fused_pair_calls"] = test["fused_pair_calls"]
+    result["fused_candidates"] = test["fused_candidates"]
+    result["single_tail_candidates"] = test["single_tail_candidates"]
+    result["fused_fallback_candidates"] = test["fused_fallback_candidates"]
+    result["direct_tail_distance_ns"] = test["direct_tail_distance_ns"]
+    result["fused_distance_ns"] = test["fused_distance_ns"]
+    result["fused_distance_ns_per_pair"] = test["fused_distance_ns_per_pair"]
     # Keep historical G/D columns only for the original comparison.
     if (baseline["distance_path"], test["distance_path"]) == ("generic", "direct"):
         for key, value in list(result.items()):
@@ -1244,8 +1260,10 @@ def summarize_phase2b_pairs(pairs):
         }
         metrics = (
             "baseline_ns_per_candidate", "test_ns_per_candidate",
+            "baseline_scan_items_ns_per_query", "test_scan_items_ns_per_query",
             "saved_ns_per_candidate", "distance_stage_speedup",
-            "test_distance_improvement_pct", "scan_items_speedup", "scan_items_improvement_pct",
+            "test_distance_improvement_pct", "scan_items_speedup",
+            "scan_items_improvement_pct", "fused_coverage_pct",
         )
         for metric in metrics:
             values = [row[metric] for row in group]
@@ -1335,7 +1353,7 @@ def run_phase2b(conn, args):
                         for query_id, query in enumerate(
                                 queries[:args.queries]):
                             conn.notices.clear()
-                            _, _, profile = execute_query(
+                            ids, _, profile = execute_query(
                                 conn, cur, config, query, args.topk, True)
                             row = parse_profile_2b(conn.notices)
                             row.update(profile)
@@ -1343,7 +1361,11 @@ def run_phase2b(conn, args):
                                 query_id=query_id, mode=mode, probes=probes,
                                 round=round_no,
                                 order_position=order_position,
-                                distance_path=distance_path)
+                                distance_path=distance_path,
+                                result_ids=";".join(str(value) for value in ids),
+                                direct_tail_distance_ns=(
+                                    row["direct_distance_ns"]
+                                    if distance_path == "fused2" else 0))
                             path_rows.append(row)
                             raw_rows.append(row)
 
@@ -1382,7 +1404,11 @@ def run_phase2b(conn, args):
                 a, b = by_path[args.baseline_path], by_path[args.test_path]
                 pair["workload_mismatch_queries"] = sum(
                     any(a[q][k] != b[q][k] for k in PHASE2B_WORKLOAD_FIELDS) for q in a)
-                pair["logic_workload_equal"] &= pair["workload_mismatch_queries"] == 0
+                pair["result_mismatch_queries"] = sum(
+                    a[q]["result_ids"] != b[q]["result_ids"] for q in a)
+                pair["logic_workload_equal"] &= (
+                    pair["workload_mismatch_queries"] == 0 and
+                    pair["result_mismatch_queries"] == 0)
                 pairs.append(pair)
 
     pair_path = Path(f"{output}_paired.csv")
