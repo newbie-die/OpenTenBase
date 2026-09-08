@@ -26,6 +26,11 @@
 #include "storage/shmem.h"		/* for add_size()/mul_size() in some versions */
 #endif
 
+/* Keep runtime distance-path selection independent of profiling timers. */
+#if defined(IVFFLAT_BENCH) || defined(IVFFLAT_FUSED2)
+#define IVFFLAT_DISTANCE_PATH
+#endif
+
 #ifdef IVFFLAT_BENCH
 #include "portability/instr_time.h"
 #endif
@@ -115,7 +120,7 @@ extern bool ivfflat_bounded_scan;
 extern int	ivfflat_bound_overfetch;
 extern int	ivfflat_bound_min;
 extern int	ivfflat_bound_fastpath_limit;
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 extern int	ivfflat_distance_path;
 #endif
 
@@ -125,7 +130,7 @@ typedef enum IvfflatIterativeScanMode
 	IVFFLAT_ITERATIVE_SCAN_RELAXED
 }			IvfflatIterativeScanMode;
 
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 typedef enum IvfflatDistancePath
 {
 	IVFFLAT_DISTANCE_PATH_GENERIC,
@@ -309,7 +314,7 @@ typedef struct IvfflatScanOpaqueData
 	bool		first;
 	Datum		value;
 	MemoryContext tmpCtx;
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 	bool		directL2Eligible;
 	bool		useDirectL2;
 	bool		useFused2;

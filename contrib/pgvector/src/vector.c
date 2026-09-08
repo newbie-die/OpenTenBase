@@ -573,7 +573,7 @@ VectorL2SquaredDistanceRaw(int dim, const float *ax, const float *bx)
 	return distance;
 }
 
-#ifdef IVFFLAT_BENCH
+#if defined(IVFFLAT_BENCH) || defined(IVFFLAT_FUSED2)
 /*
  * Share each query load across two independent L2 reductions.
  */

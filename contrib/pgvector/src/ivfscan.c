@@ -26,7 +26,7 @@
 #define GetScanList(ptr) pairingheap_container(IvfflatScanList, ph_node, ptr)
 #define GetScanListConst(ptr) pairingheap_const_container(IvfflatScanList, ph_node, ptr)
 
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 /*
  * Calculate L2 distance without fmgr while preserving varlena and dimension
  * safety.  The common IVFFlat entry representation takes the first branch.
@@ -188,7 +188,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 			Buffer		buf;
 			Page		page;
 			OffsetNumber maxoffno;
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 			/* Only a scalar distance survives to the next offset, never a Vector *. */
 			OffsetNumber pairedOffset = InvalidOffsetNumber;
 			float		pairedDistance = 0.0f;
@@ -257,7 +257,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #ifdef IVFFLAT_BENCH
 				INSTR_TIME_SET_CURRENT(distance_start);
 #endif
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 				if (so->useFused2 && offno == pairedOffset)
 				{
 					slot->tts_values[0] = Float8GetDatum((double) pairedDistance);
@@ -374,7 +374,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #endif
 			}
 
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 			Assert(pairedOffset == InvalidOffsetNumber);
 #endif
 #ifdef IVFFLAT_PROFILE_2B
@@ -465,7 +465,7 @@ GetScanValue(IndexScanDesc scan)
 			MemoryContextSwitchTo(oldCtx);
 		}
 
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 		so->useFused2 = so->directL2Eligible &&
 			ivfflat_distance_path == IVFFLAT_DISTANCE_PATH_FUSED2;
 		so->useDirectL2 = so->directL2Eligible &&
@@ -613,7 +613,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->returnedTidsCount = 0;
 	so->returnedTidsCapacity = 0;
 	so->value = PointerGetDatum(NULL);
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 	so->directL2Eligible = false;
 	so->useDirectL2 = false;
 	so->useFused2 = false;
@@ -625,7 +625,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->procinfo = index_getprocinfo(index, 1, IVFFLAT_DISTANCE_PROC);
 	so->normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_NORM_PROC);
 	so->collation = index->rd_indcollation[0];
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 	/* Exact function identity also excludes IP, cosine, halfvec, and bit. */
 	so->directL2Eligible =
 		so->procinfo->fn_addr == vector_l2_squared_distance;
@@ -714,7 +714,7 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 	so->boundedExhausted = false;
 	so->fallbackTriggered = false;
 	so->returnedTidsCount = 0;
-#ifdef IVFFLAT_BENCH
+#ifdef IVFFLAT_DISTANCE_PATH
 	if (so->directQueryNeedsFree)
 		pfree(so->directQuery);
 	so->directQuery = NULL;
