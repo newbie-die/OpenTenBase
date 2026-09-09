@@ -10,6 +10,10 @@ import random
 import re
 import statistics
 import struct
+import subprocess
+import shutil
+import fcntl
+import math
 import time
 from pathlib import Path
 
@@ -22,23 +26,10 @@ PROFILE_RE = re.compile(r"IVFFLAT_PROFILE\s+(.*)")
 PROFILE_2B_RE = re.compile(r"IVFFLAT_PROFILE_2B\s+(.*)")
 FIELD_RE = re.compile(r"([a-z0-9_]+)=(-?[0-9.]+)")
 PROBES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-FORMAL_MODES = ("full", "auto")
 FORMAL_DATASET_LABELS = {
     "glove-cosine": "glove100",
     "gist-l2": "gist1m",
 }
-FORMAL_RAW_FIELDS = (
-    "experiment", "dataset", "dimension", "metric", "mode", "lists",
-    "probes", "topk", "query_id", "latency_us", "recall_at_10",
-    "returned_rows",
-)
-FORMAL_SUMMARY_FIELDS = (
-    "dataset", "metric", "mode", "lists", "probes", "queries", "topk",
-    "mean_recall_at_10", "p50_ms", "p95_ms", "p99_ms", "mean_ms", "qps",
-    "min_returned_rows", "baseline_p50_ms", "p50_improvement_pct",
-    "baseline_p95_ms", "p95_improvement_pct", "baseline_p99_ms",
-    "p99_improvement_pct", "baseline_qps", "qps_improvement_pct",
-)
 CONFIGS = {
     "glove-l2": {
         "dataset": ROOT / "data/glove100/glove-100-angular.hdf5",
@@ -176,7 +167,14 @@ def write_json_atomic(path, value):
     with temporary.open("w") as output:
         json.dump(value, output, indent=2, sort_keys=True)
         output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
     os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def summarize_profile(rows, experiment, name, config, probes):
@@ -437,366 +435,6 @@ def formal_query(cur, sql, query_literal, topk):
     return ids, (time.perf_counter_ns() - started) / 1000.0
 
 
-def formal_manifest_configuration(args):
-    config = CONFIGS[args.dataset]
-    return {
-        "experiment": "phase_formal",
-        "dataset": FORMAL_DATASET_LABELS[args.dataset],
-        "dimension": config["dimension"],
-        "metric": config["metric"],
-        "modes": list(FORMAL_MODES),
-        "lists": args.lists,
-        "probes": list(args.probes_list),
-        "topk": args.topk,
-        "queries": args.queries,
-        "warmup_queries": args.warmup,
-    }
-
-
-def prepare_formal_manifest(path, args):
-    configuration = formal_manifest_configuration(args)
-    if path.exists():
-        with path.open() as source:
-            manifest = json.load(source)
-        if not args.resume:
-            raise RuntimeError(f"formal output already exists; use --resume: {path.parent}")
-        if manifest.get("configuration") != configuration:
-            raise RuntimeError("resume configuration does not match phase_formal_manifest.json")
-        return manifest
-    if args.resume:
-        raise RuntimeError(f"cannot resume without manifest: {path}")
-    manifest = {"configuration": configuration, "ground_truth_verification": None}
-    write_json_atomic(path, manifest)
-    return manifest
-
-
-def formal_checkpoint_path(checkpoint_dir, dataset, metric, mode, probes):
-    return checkpoint_dir / f"{dataset}_{metric}_{mode}_p{probes}.csv"
-
-
-def load_formal_checkpoint(path, expected, query_count):
-    if not path.exists():
-        return []
-    with path.open(newline="") as source:
-        reader = csv.DictReader(source)
-        if tuple(reader.fieldnames or ()) != FORMAL_RAW_FIELDS:
-            raise RuntimeError(f"unexpected formal checkpoint schema: {path}")
-        parsed = list(reader)
-
-    rows = []
-    seen = set()
-    for position, row in enumerate(parsed):
-        if None in row or any(value is None or value == "" for value in row.values()):
-            if position == len(parsed) - 1:
-                print(f"discard incomplete trailing checkpoint row: {path}", flush=True)
-                continue
-            raise RuntimeError(f"invalid checkpoint row in {path}")
-        query_id = int(row["query_id"])
-        if query_id < 0 or query_id >= query_count:
-            raise RuntimeError(f"query_id out of range in {path}: {query_id}")
-        if query_id in seen:
-            raise RuntimeError(f"duplicate query_id in {path}: {query_id}")
-        for key, value in expected.items():
-            if str(row[key]) != str(value):
-                raise RuntimeError(f"checkpoint config mismatch in {path}: {key}")
-        float(row["latency_us"])
-        float(row["recall_at_10"])
-        int(row["returned_rows"])
-        seen.add(query_id)
-        rows.append(row)
-    return rows
-
-
-def append_formal_checkpoint(path, row):
-    with path.open("a", newline="") as output:
-        csv.DictWriter(output, fieldnames=FORMAL_RAW_FIELDS).writerow(row)
-
-
-def configure_formal_scan(cur, probes, mode):
-    bounded_scan = "on" if mode == "auto" else "off"
-    cur.execute("SET enable_indexscan = on")
-    cur.execute("SET enable_seqscan = off")
-    cur.execute("SET ivfflat.iterative_scan = off")
-    cur.execute("SELECT set_config(%s, %s, false)", ("ivfflat.probes", str(probes)))
-    cur.execute("SELECT set_config(%s, %s, false)",
-                ("ivfflat.experimental_sort_bound", "0"))
-    cur.execute("SELECT set_config(%s, %s, false)",
-                ("ivfflat.bounded_scan", bounded_scan))
-    cur.execute("SELECT set_config(%s, %s, false)", ("ivfflat.bound_overfetch", "4"))
-    cur.execute("SELECT set_config(%s, %s, false)", ("ivfflat.bound_min", "40"))
-    cur.execute("SELECT set_config(%s, %s, false)",
-                ("ivfflat.bound_fastpath_limit", "100"))
-
-    expected = {
-        "ivfflat.probes": str(probes),
-        "ivfflat.iterative_scan": "off",
-        "ivfflat.experimental_sort_bound": "0",
-        "ivfflat.bounded_scan": bounded_scan,
-    }
-    actual = {}
-    for setting, expected_value in expected.items():
-        cur.execute(f"SHOW {setting}")
-        actual[setting] = cur.fetchone()[0]
-        if actual[setting] != expected_value:
-            raise RuntimeError(
-                f"GUC verification failed for {setting}: "
-                f"expected {expected_value}, got {actual[setting]}"
-            )
-    print(f"formal GUC mode={mode} probes={probes} values={actual}", flush=True)
-
-
-def run_formal_config(conn, args, config, query_literals, neighbors,
-                      checkpoint_dir, probes, mode):
-    dataset_name = FORMAL_DATASET_LABELS[args.dataset]
-    expected = {
-        "experiment": "phase_formal",
-        "dataset": dataset_name,
-        "dimension": config["dimension"],
-        "metric": config["metric"],
-        "mode": mode,
-        "lists": args.lists,
-        "probes": probes,
-        "topk": args.topk,
-    }
-    checkpoint = formal_checkpoint_path(
-        checkpoint_dir, dataset_name, config["metric"], mode, probes)
-    if checkpoint.exists() and not args.resume:
-        raise RuntimeError(f"formal checkpoint already exists; use --resume: {checkpoint}")
-    existing = load_formal_checkpoint(checkpoint, expected, args.queries)
-    write_csv_atomic(checkpoint, sorted(existing, key=lambda row: int(row["query_id"])),
-                     FORMAL_RAW_FIELDS)
-    completed = {int(row["query_id"]) for row in existing}
-    if len(completed) == args.queries:
-        print(f"formal skip complete mode={mode} probes={probes}", flush=True)
-        return
-
-    print(f"formal run mode={mode} probes={probes} "
-          f"remaining={args.queries - len(completed)}", flush=True)
-    sql = (f"SELECT id FROM {config['table']} "
-           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
-    with conn.cursor() as cur:
-        ensure_index(cur, config)
-        configure_formal_scan(cur, probes, mode)
-        for query_literal in query_literals[:args.warmup]:
-            formal_query(cur, sql, query_literal, args.topk)
-        for query_id in range(args.queries):
-            if query_id in completed:
-                continue
-            ids, latency_us = formal_query(
-                cur, sql, query_literals[query_id], args.topk)
-            ground_truth = {int(value) for value in neighbors[query_id]}
-            row = {
-                **expected,
-                "query_id": query_id,
-                "latency_us": latency_us,
-                "recall_at_10": len(ground_truth.intersection(ids)) / args.topk,
-                "returned_rows": len(ids),
-            }
-            append_formal_checkpoint(checkpoint, row)
-            existing.append(row)
-
-    write_csv_atomic(checkpoint, sorted(existing, key=lambda row: int(row["query_id"])),
-                     FORMAL_RAW_FIELDS)
-
-
-def formal_group_stats(rows):
-    latencies_us = [float(row["latency_us"]) for row in rows]
-    total_seconds = sum(latencies_us) / 1_000_000.0
-    return {
-        "mean_recall_at_10": statistics.fmean(
-            float(row["recall_at_10"]) for row in rows),
-        "p50_ms": percentile(latencies_us, 50) / 1000.0,
-        "p95_ms": percentile(latencies_us, 95) / 1000.0,
-        "p99_ms": percentile(latencies_us, 99) / 1000.0,
-        "mean_ms": statistics.fmean(latencies_us) / 1000.0,
-        "qps": len(rows) / total_seconds if total_seconds else 0.0,
-        "min_returned_rows": min(int(row["returned_rows"]) for row in rows),
-    }
-
-
-def summarize_formal(rows):
-    grouped = {}
-    for row in rows:
-        grouped.setdefault((int(row["probes"]), row["mode"]), []).append(row)
-
-    output = []
-    for probes in sorted({key[0] for key in grouped}):
-        full_rows = grouped.get((probes, "full"))
-        if not full_rows:
-            continue
-        baseline = formal_group_stats(full_rows)
-        for mode in FORMAL_MODES:
-            group = grouped.get((probes, mode))
-            if not group:
-                continue
-            values = formal_group_stats(group)
-            output.append({
-                "dataset": group[0]["dataset"],
-                "metric": group[0]["metric"],
-                "mode": mode,
-                "lists": int(group[0]["lists"]),
-                "probes": probes,
-                "queries": len(group),
-                "topk": int(group[0]["topk"]),
-                **values,
-                "baseline_p50_ms": baseline["p50_ms"],
-                "p50_improvement_pct": (
-                    100 * (baseline["p50_ms"] - values["p50_ms"])
-                    / baseline["p50_ms"] if baseline["p50_ms"] else 0.0),
-                "baseline_p95_ms": baseline["p95_ms"],
-                "p95_improvement_pct": (
-                    100 * (baseline["p95_ms"] - values["p95_ms"])
-                    / baseline["p95_ms"] if baseline["p95_ms"] else 0.0),
-                "baseline_p99_ms": baseline["p99_ms"],
-                "p99_improvement_pct": (
-                    100 * (baseline["p99_ms"] - values["p99_ms"])
-                    / baseline["p99_ms"] if baseline["p99_ms"] else 0.0),
-                "baseline_qps": baseline["qps"],
-                "qps_improvement_pct": (
-                    100 * (values["qps"] - baseline["qps"])
-                    / baseline["qps"] if baseline["qps"] else 0.0),
-            })
-    return output
-
-
-def merge_formal_outputs(args, checkpoint_dir, output_prefix):
-    config = CONFIGS[args.dataset]
-    dataset_name = FORMAL_DATASET_LABELS[args.dataset]
-    rows = []
-    seen = set()
-    for probes in args.probes_list:
-        for mode in FORMAL_MODES:
-            expected = {
-                "experiment": "phase_formal", "dataset": dataset_name,
-                "dimension": config["dimension"], "metric": config["metric"],
-                "mode": mode,
-                "lists": args.lists, "probes": probes, "topk": args.topk,
-            }
-            checkpoint = formal_checkpoint_path(
-                checkpoint_dir, dataset_name, config["metric"], mode, probes)
-            config_rows = load_formal_checkpoint(checkpoint, expected, args.queries)
-            if len(config_rows) != args.queries:
-                continue
-            for row in config_rows:
-                key = (row["dataset"], row["metric"], row["mode"],
-                       int(row["probes"]), int(row["query_id"]))
-                if key in seen:
-                    raise RuntimeError(f"duplicate formal key while merging: {key}")
-                seen.add(key)
-                rows.append(row)
-
-    mode_order = {mode: position for position, mode in enumerate(FORMAL_MODES)}
-    rows.sort(key=lambda row: (int(row["probes"]), mode_order[row["mode"]],
-                               int(row["query_id"])))
-    if rows:
-        write_csv_atomic(Path(f"{output_prefix}_raw.csv"), rows, FORMAL_RAW_FIELDS)
-        write_csv_atomic(Path(f"{output_prefix}_summary.csv"),
-                         summarize_formal(rows), FORMAL_SUMMARY_FIELDS)
-    return rows
-
-
-def verify_formal_production_build(conn, args, config, query_literal):
-    sql = (f"SELECT id FROM {config['table']} "
-           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
-    with conn.cursor() as cur:
-        configure_formal_scan(cur, args.probes_list[0], "full")
-        cur.execute("SET client_min_messages = info")
-        conn.notices.clear()
-        try:
-            formal_query(cur, sql, query_literal, args.topk)
-            if any(PROFILE_RE.search(notice) for notice in conn.notices):
-                raise RuntimeError(
-                    "formal phase requires a production build without IVFFLAT_BENCH")
-        finally:
-            conn.notices.clear()
-            cur.execute("RESET client_min_messages")
-    print("formal production-build check: IVFFLAT_BENCH profiling is off", flush=True)
-
-
-def verify_formal_ground_truth(conn, args, config, query_literals, neighbors):
-    sample_count = min(args.ground_truth_queries, args.queries)
-    query_ids = sorted(random.Random(20260903).sample(range(args.queries), sample_count))
-    sql = (f"SELECT id FROM {config['table']} "
-           f"ORDER BY embedding {config['operator']} %s::vector LIMIT %s")
-    recalls = []
-    matches = 0
-    with conn.cursor() as cur:
-        cur.execute("SET enable_indexscan = off")
-        cur.execute("SET enable_indexonlyscan = off")
-        cur.execute("SET enable_bitmapscan = off")
-        cur.execute("SET enable_seqscan = on")
-        try:
-            for query_id in query_ids:
-                ids, _ = formal_query(cur, sql, query_literals[query_id], args.topk)
-                ground_truth = {int(value) for value in neighbors[query_id]}
-                recall = len(ground_truth.intersection(ids)) / args.topk
-                recalls.append(recall)
-                matches += int(set(ids) == ground_truth)
-        finally:
-            cur.execute("RESET enable_indexscan")
-            cur.execute("RESET enable_indexonlyscan")
-            cur.execute("RESET enable_bitmapscan")
-            cur.execute("RESET enable_seqscan")
-    result = {
-        "queries": sample_count,
-        "exact_set_matches": matches,
-        "mean_recall_at_10": statistics.fmean(recalls),
-        "query_ids": query_ids,
-    }
-    print(f"formal ground-truth verification: {result}", flush=True)
-    if matches != sample_count:
-        raise RuntimeError("ANN-Benchmarks ground truth differs from PostgreSQL exact Top-10")
-    return result
-
-
-def run_formal(conn, args):
-    if args.queries <= 0:
-        raise ValueError("--queries must be positive")
-    if args.warmup < 0:
-        raise ValueError("--warmup-queries must not be negative")
-    if args.ground_truth_queries <= 0:
-        raise ValueError("--ground-truth-queries must be positive")
-    if args.lists != 1000 or args.topk != 10:
-        raise ValueError("formal phase requires lists=1000 and topk=10")
-    if len(set(args.probes_list)) != len(args.probes_list):
-        raise ValueError("--probes-list must not contain duplicates")
-    if any(probes <= 0 or probes > args.lists for probes in args.probes_list):
-        raise ValueError("formal probes must be between 1 and lists")
-
-    config = CONFIGS[args.dataset]
-    load_count = max(args.queries, args.warmup)
-    queries, neighbors = load_workload(config, load_count, args.topk, True)
-    if len(queries) != load_count or len(neighbors) != load_count:
-        raise RuntimeError(
-            f"dataset contains fewer than requested {load_count} query vectors")
-    query_literals = [vector_literal(query) for query in queries]
-
-    verify_formal_production_build(conn, args, config, query_literals[0])
-    output_prefix = Path(args.output or ROOT / "results/phase_formal")
-    checkpoint_dir = output_prefix.parent / f".{output_prefix.name}_checkpoints"
-    manifest_path = output_prefix.parent / f"{output_prefix.name}_manifest.json"
-    manifest = prepare_formal_manifest(manifest_path, args)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.verify_ground_truth:
-        verification = verify_formal_ground_truth(
-            conn, args, config, query_literals, neighbors)
-        manifest["ground_truth_verification"] = verification
-        write_json_atomic(manifest_path, manifest)
-
-    for probes in args.probes_list:
-        for mode in FORMAL_MODES:
-            run_formal_config(conn, args, config, query_literals, neighbors,
-                              checkpoint_dir, probes, mode)
-            merge_formal_outputs(args, checkpoint_dir, output_prefix)
-
-    rows = merge_formal_outputs(args, checkpoint_dir, output_prefix)
-    expected_rows = len(args.probes_list) * len(FORMAL_MODES) * args.queries
-    if len(rows) != expected_rows:
-        raise RuntimeError(
-            f"formal merge incomplete: expected {expected_rows}, got {len(rows)}")
-    print(f"formal complete configs={len(args.probes_list) * len(FORMAL_MODES)} "
-          f"queries_per_config={args.queries} rows={len(rows)}", flush=True)
 
 
 PHASE2B_WORKLOAD_FIELDS = (
@@ -1844,6 +1482,394 @@ def validate_phase2b_options(args):
         raise ValueError("--check-fused2-edges requires a fused2 comparison")
 
 
+# Phase C extends the shared runner; Part 2 is deliberately not enabled here.
+PHASE_C_SYSTEMS = ('pristine', 'vanilla_eq', 'phase2a', 'phase2b', 'final')
+PHASE_C_FLAGS = '-march=haswell -mtune=haswell -mavx2 -mfma'
+
+
+def phase_c_command(argv, **kwargs):
+    return subprocess.check_output([str(x) for x in argv], text=True, **kwargs).strip()
+
+
+def phase_c_hash(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def phase_c_prepare(args, root):
+    repo = SCRIPT_ROOT.parent
+    pristine = Path(os.environ.get('PRISTINE_WORKTREE', '/workspace/OpenTenBase-pristine'))
+    commit = os.environ.get('PRISTINE_COMMIT')
+    if not commit:
+        raise RuntimeError('PRISTINE_COMMIT must be explicitly supplied')
+    git = lambda *a: phase_c_command(['git', '-C', repo, *a])
+    commit = git('rev-parse', commit + '^{commit}')
+    optimized = git('rev-parse', 'HEAD')
+    # This reviewed allowlist is intentionally fail-closed for future source changes.
+    reviewed_pristine = git('rev-parse', 'd65ea656^{commit}')
+    if commit != reviewed_pristine:
+        raise RuntimeError('Unreviewed pristine commit: inspect provenance and disk compatibility first')
+    if git('rev-parse', 'HEAD:contrib/pgvector') != '5e22d78fca56dfd0c6abd126d8e459a2d4d7bd92':
+        raise RuntimeError('Unreviewed optimized source tree; repeat compatibility review')
+    changed = git('diff', '--name-only', commit, 'HEAD', '--', 'contrib/pgvector').splitlines()
+    allowed = {'Makefile', 'src/ivfflat.c', 'src/ivfflat.h', 'src/ivfscan.c', 'src/vector.c', 'src/vector.h'}
+    if any(p.removeprefix('contrib/pgvector/') not in allowed for p in changed):
+        raise RuntimeError('Unreviewed pgvector storage/build changes; shared index forbidden')
+    if git('status', '--porcelain', '--', 'contrib/pgvector'):
+        raise RuntimeError('Optimized pgvector source must be clean')
+    source_diff = git('diff', commit, 'HEAD', '--', 'contrib/pgvector')
+    (root / 'phase_c_source_diff.patch').write_text(source_diff + '\n')
+    # Disk structs and their page constants must remain byte-for-byte identical.
+    before = git('show', commit + ':contrib/pgvector/src/ivfflat.h')
+    after = (repo / 'contrib/pgvector/src/ivfflat.h').read_text()
+    for name in ('IvfflatMetaPageData', 'IvfflatPageOpaqueData', 'IvfflatListData'):
+        pattern = r'typedef struct ' + name + r'\b.*?\}\s*' + name + r';'
+        a, b = re.search(pattern, before, re.S), re.search(pattern, after, re.S)
+        if not a or not b or a.group() != b.group():
+            raise RuntimeError('Disk format changed or unrecognized: ' + name)
+    for token in ('bounded_scan', 'distance_path', 'IVFFLAT_FUSED2', 'IVFFLAT_PROFILE_2B', 'profile_candidates'):
+        if token in git('show', commit + ':contrib/pgvector/src/ivfscan.c'):
+            raise RuntimeError('Pristine contains research modifications: ' + token)
+    if not pristine.exists():
+        subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '--detach', str(pristine), commit], check=True)
+    if phase_c_command(['git', '-C', pristine, 'rev-parse', 'HEAD']) != commit:
+        raise RuntimeError('Wrong pristine worktree commit')
+    if phase_c_command(['git', '-C', pristine, 'status', '--porcelain']):
+        raise RuntimeError('Pristine worktree must be clean')
+    compiler = phase_c_command(['gcc', '--version'])
+    if phase_c_command(['gcc', '-dumpfullversion']) != '11.5.0':
+        raise RuntimeError('GCC 11.5.0 is required')
+    pg_config = os.environ.get('PG_CONFIG', '/workspace/install/bin/pg_config')
+    metadata = {'pristine_commit': commit, 'optimized_commit': optimized,
+                'optimized_pgvector_tree': git('rev-parse', 'HEAD:contrib/pgvector'),
+                'pristine_pgvector_tree': git('rev-parse', commit + ':contrib/pgvector'),
+                'compiler': compiler, 'compile_flags': '-O2 ' + PHASE_C_FLAGS + ' -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math',
+                'profiling_timers_disabled': True, 'on_disk_format_changed': False,
+                'shared_index_safe': True, 'postgres_sha256': phase_c_hash(Path(pg_config).with_name('postgres'))}
+    for label, source in [('pristine', pristine), ('optimized', repo)]:
+        status = phase_c_command(['git', '-C', source, 'status', '--short', '--untracked-files=all'])
+        (root / f'phase_c_{label}_source_status.txt').write_text(status + '\n')
+        metadata[label + '_clean'] = not bool(status)
+        destination = root / 'binaries' / label
+        destination.mkdir(parents=True, exist_ok=True)
+        command = ['make', '-C', str(source / 'contrib/pgvector'), '-B', '-j8', 'CC=gcc', 'PG_CONFIG=' + pg_config, 'OPTFLAGS=' + PHASE_C_FLAGS]
+        if label == 'optimized':
+            command += ['IVFFLAT_PROFILE_CFLAGS=-DIVFFLAT_FUSED2']
+        env = dict(os.environ)
+        for name in ('PG_CFLAGS', 'CFLAGS', 'CPPFLAGS', 'IVFFLAT_PROFILE_CFLAGS', 'MAKEFLAGS'):
+            env.pop(name, None)
+        with (root / f'{label}_compile_command.txt').open('w') as log:
+            log.write('argv=' + json.dumps(command) + '\n')
+            log.flush()
+            subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        log = (root / f'{label}_compile_command.txt').read_text()
+        if '-DIVFFLAT_BENCH' in log or '-DIVFFLAT_PROFILE_2B' in log:
+            raise RuntimeError('Profiling enabled in formal build')
+        so = source / 'contrib/pgvector/vector.so'
+        if 'IVFFLAT_PROFILE' in phase_c_command(['strings', so]):
+            raise RuntimeError('Profiling NOTICE found')
+        symbols = phase_c_command(['nm', '-u', so])
+        if re.search(r'\b(clock_gettime|gettimeofday)\b', symbols):
+            raise RuntimeError('Unexpected timer dependency in vector.so')
+        shutil.copy2(so, destination / 'vector.so')
+        metadata[label + '_binary_sha256'] = phase_c_hash(destination / 'vector.so')
+        write_json_atomic(destination / 'phase_c_build.json', {'commit': commit if label == 'pristine' else optimized, 'compiler': compiler, 'flags': metadata['compile_flags'], 'sha256': metadata[label + '_binary_sha256'], 'profiling': False})
+    metadata['installed_so'] = phase_c_command([pg_config, '--pkglibdir']) + '/vector.so'
+    write_json_atomic(root / 'phase_c_build_manifest.json', metadata)
+    return metadata
+
+
+def phase_c_activate(args, root, metadata, binary):
+    source = root / 'binaries' / binary / 'vector.so'
+    expected = metadata[binary + '_binary_sha256']
+    if phase_c_hash(source) != expected:
+        raise RuntimeError('Archived binary hash mismatch')
+    pg_ctl = os.environ.get('PG_CTL', '/workspace/install/bin/pg_ctl')
+    data = os.environ.get('PGDATA', '/workspace/data')
+    os_user = os.environ.get('PG_OS_USER', 'dev')
+    command = (['runuser', '-u', os_user, '--'] if os.getuid() == 0 else []) + [pg_ctl, '-D', data]
+    # Stop/start even if the on-disk hash matches: existing backends could have loaded another image.
+    status = subprocess.run(command + ['status'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if status.returncode == 0:
+        subprocess.run(command + ['stop', '-m', 'fast', '-w'], check=True)
+    elif status.returncode != 3:
+        raise RuntimeError('Cannot determine PostgreSQL status')
+    shutil.copy2(source, metadata['installed_so'])
+    if phase_c_hash(metadata['installed_so']) != expected:
+        raise RuntimeError('Installed binary hash mismatch')
+    subprocess.run(command + ['start', '-l', str(Path(data) / 'phase_c_server.log'), '-w'], check=True)
+    conn = connect(args)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("LOAD 'vector'")
+        cur.execute('SELECT 1')
+        assert cur.fetchone()[0] == 1
+    with (root / 'phase_c_activation.jsonl').open('a') as log:
+        log.write(json.dumps({'binary': binary, 'sha256': expected, 'time': time.time(), 'readiness': True}) + '\n')
+    return conn
+
+
+def activate_pristine(args, root, metadata):
+    return phase_c_activate(args, root, metadata, 'pristine')
+
+
+def activate_optimized(args, root, metadata):
+    return phase_c_activate(args, root, metadata, 'optimized')
+
+
+def phase_c_index(cur):
+    cur.execute("SELECT c.oid,c.relfilenode,pg_relation_size(c.oid),pg_get_indexdef(c.oid),i.indisvalid FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass('gist_ivf_l2')")
+    row = cur.fetchone()
+    return dict(zip(('oid', 'relfilenode', 'bytes', 'definition', 'valid'), row)) if row else None
+
+
+def phase_c_settings(cur, system, probes):
+    settings = {'ivfflat.probes': str(probes), 'ivfflat.iterative_scan': 'off'}
+    if system != 'pristine':
+        settings.update({'ivfflat.distance_path': 'fused2' if system in ('phase2b', 'final') else 'generic',
+                         'ivfflat.bounded_scan': 'on' if system in ('phase2a', 'final') else 'off',
+                         'ivfflat.experimental_sort_bound': '0', 'ivfflat.bound_overfetch': '4',
+                         'ivfflat.bound_min': '40', 'ivfflat.bound_fastpath_limit': '100'})
+    # pg_settings verifies registration, unlike custom placeholder GUCs.
+    for key, value in settings.items():
+        cur.execute('SELECT setting FROM pg_settings WHERE name=%s', (key,))
+        if cur.fetchone() is None:
+            raise RuntimeError('Missing registered GUC: ' + key)
+        cur.execute('SELECT set_config(%s,%s,false)', (key, value))
+        if cur.fetchone()[0] != value:
+            raise RuntimeError('GUC did not take effect: ' + key)
+    cur.execute('SET enable_seqscan=off')
+    cur.execute('SET enable_indexscan=on')
+    cur.execute('SET max_parallel_workers_per_gather=0')
+    return settings
+
+
+def phase_c_audit(conn, root, queries, neighbors):
+    import h5py
+    import numpy as np
+    result = {'queries_verified': 20, 'exact_matches': 0, 'status': 'FAIL', 'queries': []}
+    sql = 'SELECT id FROM gist_base ORDER BY embedding <-> %s::vector LIMIT %s'
+    with conn.cursor() as cur, h5py.File(CONFIGS['gist-l2']['dataset'], 'r') as dataset:
+        if dataset['train'].shape != (1000000, 960) or dataset['test'].shape != (1000, 960):
+            raise RuntimeError('Wrong GIST1M dimensions')
+        cur.execute('SELECT count(*),count(DISTINCT id),min(id),max(id) FROM gist_base')
+        result['table_counts'] = list(cur.fetchone())
+        if result['table_counts'] != [1000000, 1000000, 0, 999999]:
+            raise RuntimeError('Unsupported ID mapping; inspect data loader')
+        sampled = sorted(random.Random(20260908).sample(range(1000000), 20))
+        for rowid in sampled:
+            cur.execute('SELECT embedding::text FROM gist_base WHERE id=%s', (rowid,))
+            actual = np.asarray(json.loads(cur.fetchone()[0]), dtype=np.float32)
+            if not np.array_equal(actual, dataset['train'][rowid]):
+                raise RuntimeError('SQL id does not map to HDF5 train row')
+        result['id_mapping'] = {'offset': 0, 'mapping': 'SQL id = HDF5 train row index', 'vector_content_checked_ids': sampled}
+        cur.execute('SET enable_indexscan=off')
+        cur.execute('SET enable_indexonlyscan=off')
+        cur.execute('SET enable_bitmapscan=off')
+        cur.execute('SET enable_seqscan=on')
+        cur.execute('SET max_parallel_workers_per_gather=0')
+        for qid in sorted(random.Random(20260908).sample(range(1000), 20)):
+            literal = vector_literal(queries[qid])
+            cur.execute('EXPLAIN (FORMAT JSON) ' + sql, (literal, 10))
+            plan = cur.fetchone()[0]
+            if 'Index' in json.dumps(plan) or 'Seq Scan' not in json.dumps(plan):
+                raise RuntimeError('Exact audit did not use sequential scan')
+            ids, latency = formal_query(cur, sql, literal, 10)
+            gt = [int(i) for i in neighbors[qid]]
+            match = set(ids) == set(gt)
+            if match and ids != gt:
+                cur.execute('SELECT id,embedding <-> %s::vector FROM gist_base WHERE id=ANY(%s)', (literal, ids))
+                distances = dict(cur.fetchall())
+                inversions = [(a, b) for pos, a in enumerate(ids) for b in ids[pos + 1:] if gt.index(a) > gt.index(b)]
+                result.setdefault('ordering_differences', []).append({
+                    'query_id': qid, 'inversions': inversions,
+                    'sql_distances': distances,
+                    'all_inversions_are_equal_distance': all(distances[a] == distances[b] for a, b in inversions)})
+            result['exact_matches'] += int(match)
+            result['queries'].append({'query_id': qid, 'ids': ids, 'official_ids': gt, 'set_equal': match, 'ordered_equal': ids == gt, 'latency_us': latency, 'plan': plan})
+            write_json_atomic(root / 'ground_truth_verification.json', result)
+            print(f'Phase C exact audit query={qid} match={match}', flush=True)
+        for key in ('enable_indexscan', 'enable_indexonlyscan', 'enable_bitmapscan', 'enable_seqscan'):
+            cur.execute('RESET ' + key)
+    result['status'] = 'PASS' if result['exact_matches'] == 20 else 'FAIL'
+    result['tie_policy'] = 'Require exact Top10 set equality; ordering differences within the same set are recorded. Boundary-set differences fail closed.'
+    write_json_atomic(root / 'ground_truth_verification.json', result)
+    if result['status'] != 'PASS':
+        raise RuntimeError('Ground truth audit failed; STOP')
+    return result
+
+
+def phase_c_key(row):
+    return (row['system'], row['probes'], row['round'], row['query_id'])
+
+
+def phase_c_validate_checkpoint(rows, expected, manifest, neighbors):
+    keys = [phase_c_key(row) for row in rows]
+    if len(set(keys)) != len(keys) or not set(keys) <= expected:
+        raise RuntimeError('Duplicate or unexpected execution key')
+    fields = {'phase', 'experiment', 'smoke', 'system', 'probes', 'round', 'query_id',
+              'result_ids', 'recall_at_10', 'latency_us', 'returned_rows', 'binary_sha256'}
+    for row in rows:
+        binary = 'pristine' if row['system'] == 'pristine' else 'optimized'
+        ids = row['result_ids']
+        if (set(row) != fields or row['phase'] != 'C' or row['experiment'] != 'phase_c'
+                or row['smoke'] is not True or row['returned_rows'] != 10
+                or len(ids) != 10 or len(set(ids)) != 10
+                or any(type(i) is not int or not 0 <= i < 1000000 for i in ids)
+                or row['binary_sha256'] != manifest[binary + '_binary_sha256']
+                or not math.isfinite(row['latency_us']) or row['latency_us'] <= 0
+                or row['recall_at_10'] != len(set(ids) & set(map(int, neighbors[row['query_id']]))) / 10):
+            raise RuntimeError('Invalid checkpoint row')
+    return keys
+
+
+def validate_phase_c_options(args):
+    if not args.part1 or (args.dataset, args.queries, args.warmup, args.rounds, tuple(args.probes_list), args.lists, args.topk) != ('gist-l2', 3, 1, 1, (16,), 1000, 10):
+        raise ValueError('Phase C Part 1 only: --part1 --dataset gist-l2 --queries 3 --warmup 1 --rounds 1 --probes-list 16 --lists 1000 --topk 10')
+    if args.stop_after < 0 or args.stop_after >= 15:
+        raise ValueError('--stop-after must be 0 or between 1 and 14')
+
+
+def run_formal(conn, args):
+    conn.close()
+    validate_phase_c_options(args)
+    root = Path(args.output or ROOT / 'phase_c_artifacts').resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / '.phase_c.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # The PostgreSQL installation is shared across output directories.
+        with (ROOT / '.phase_c_database.lock').open('w') as db_lock:
+            fcntl.flock(db_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            phase_c_part1(args, root)
+
+
+def phase_c_part1(args, root):
+    manifest_path = root / 'phase_c_manifest.json'
+    if args.resume:
+        manifest = json.loads(manifest_path.read_text())
+        metadata = json.loads((root / 'phase_c_build_manifest.json').read_text())
+        supplied = os.environ.get('PRISTINE_COMMIT', '')
+        if not supplied or phase_c_command(['git', '-C', SCRIPT_ROOT.parent, 'rev-parse', supplied + '^{commit}']) != manifest['pristine_commit']:
+            raise RuntimeError('Resume pristine commit mismatch')
+        if phase_c_command(['git', '-C', SCRIPT_ROOT.parent, 'rev-parse', 'HEAD']) != manifest['optimized_commit']:
+            raise RuntimeError('Resume optimized commit mismatch')
+        if phase_c_command(['git', '-C', SCRIPT_ROOT.parent, 'status', '--porcelain', '--', 'contrib/pgvector']):
+            raise RuntimeError('Optimized source changed since build')
+        if any(manifest.get(key) != value for key, value in metadata.items()):
+            raise RuntimeError('Build metadata differs from manifest')
+        if phase_c_hash(CONFIGS['gist-l2']['dataset']) != manifest['dataset_sha256']:
+            raise RuntimeError('Dataset changed since audit')
+        if phase_c_hash('/workspace/install/bin/postgres') != manifest['postgres_sha256']:
+            raise RuntimeError('PostgreSQL binary changed since initial run')
+    else:
+        if manifest_path.exists():
+            raise RuntimeError('Output exists; use --resume')
+        metadata = phase_c_prepare(args, root)
+        manifest = {'phase': 'C', 'experiment': 'phase_c', 'part': 1, 'smoke_only': True,
+                    'dataset': 'GIST1M', 'dimension': 960, 'metric': 'L2', 'base_vectors': 1000000,
+                    'official_queries': 1000, 'lists': 1000, 'topk': 10, 'queries': 3,
+                    'warmup': 1, 'probes': [16], 'rounds': 1, 'shuffle_seeds': [20260908],
+                    'systems': list(PHASE_C_SYSTEMS), **metadata}
+        manifest['dataset_sha256'] = phase_c_hash(CONFIGS['gist-l2']['dataset'])
+        write_json_atomic(manifest_path, manifest)
+    for name in ('pristine', 'optimized'):
+        if phase_c_hash(root / 'binaries' / name / 'vector.so') != manifest[name + '_binary_sha256']:
+            raise RuntimeError('Resume archive hash mismatch')
+    queries, neighbors = load_workload(CONFIGS['gist-l2'], 1000, 10, True)
+    sql = 'SELECT id FROM gist_base ORDER BY embedding <-> %s::vector LIMIT %s'
+    conn = activate_pristine(args, root, metadata)
+    try:
+        with conn.cursor() as cur:
+            if 'index' not in manifest:
+                print('Phase C building shared index once with pristine', flush=True)
+                cur.execute('DROP INDEX IF EXISTS gist_ivf_l2')
+                cur.execute('CREATE INDEX gist_ivf_l2 ON gist_base USING ivfflat (embedding vector_l2_ops) WITH (lists=1000)')
+                cur.execute('ANALYZE gist_base')
+                manifest['index'] = phase_c_index(cur)
+                write_json_atomic(manifest_path, manifest)
+            if phase_c_index(cur) != manifest['index']:
+                raise RuntimeError('Shared index identity changed')
+        audit_path = root / 'ground_truth_verification.json'
+        if not audit_path.exists() or json.loads(audit_path.read_text()).get('status') != 'PASS':
+            phase_c_audit(conn, root, queries, neighbors)
+    finally:
+        conn.close()
+    checkpoint = root / 'phase_c_smoke_checkpoint.json'
+    rows = json.loads(checkpoint.read_text()) if checkpoint.exists() else []
+    expected = {(s, 16, 0, q) for s in PHASE_C_SYSTEMS for q in range(3)}
+    keys = phase_c_validate_checkpoint(rows, expected, manifest, neighbors)
+    resume_before = list(keys)
+    executed = []
+    mapping = {}
+    plans = {}
+    for system in PHASE_C_SYSTEMS:
+        binary = 'pristine' if system == 'pristine' else 'optimized'
+        conn = phase_c_activate(args, root, metadata, binary)
+        try:
+            with conn.cursor() as cur:
+                if phase_c_hash(metadata['installed_so']) != manifest[binary + '_binary_sha256']:
+                    raise RuntimeError('Active binary hash mismatch before config')
+                if phase_c_index(cur) != manifest['index']:
+                    raise RuntimeError('Shared index changed after switch')
+                mapping[system] = {'binary': binary, 'sha256': manifest[binary + '_binary_sha256'], 'gucs': phase_c_settings(cur, system, 16)}
+                cur.execute('EXPLAIN (FORMAT JSON) ' + sql, (vector_literal(queries[0]), 10))
+                plans[system] = cur.fetchone()[0]
+                if 'gist_ivf_l2' not in json.dumps(plans[system]) or 'Index Scan' not in json.dumps(plans[system]):
+                    raise RuntimeError('Smoke did not select shared ANN index')
+                missing = [q for q in range(3) if (system, 16, 0, q) not in keys]
+                if missing:
+                    formal_query(cur, sql, vector_literal(queries[0]), 10)
+                random.Random(20260908).shuffle(missing)
+                for qid in missing:
+                    conn.notices.clear()
+                    ids, latency = formal_query(cur, sql, vector_literal(queries[qid]), 10)
+                    if len(ids) != 10 or len(set(ids)) != 10 or any('IVFFLAT_PROFILE' in n for n in conn.notices):
+                        raise RuntimeError('Invalid result count or profiling NOTICE')
+                    gt = {int(i) for i in neighbors[qid]}
+                    row = {'phase': 'C', 'experiment': 'phase_c', 'smoke': True, 'system': system,
+                           'probes': 16, 'round': 0, 'query_id': qid, 'result_ids': ids,
+                           'recall_at_10': len(set(ids) & gt) / 10, 'latency_us': latency,
+                           'returned_rows': len(ids), 'binary_sha256': manifest[binary + '_binary_sha256']}
+                    rows.append(row)
+                    keys.append(phase_c_key(row))
+                    executed.append(phase_c_key(row))
+                    write_json_atomic(checkpoint, rows)
+                    print(f'Phase C smoke {system} query={qid} recall={row["recall_at_10"]}', flush=True)
+                    if args.stop_after and len(executed) >= args.stop_after:
+                        write_json_atomic(root / 'phase_c_interruption.json', {'checkpoint_keys': keys, 'stop_after': args.stop_after, 'status': 'interrupted'})
+                        raise SystemExit(75)
+        finally:
+            conn.close()
+    if set(keys) != expected or len(rows) != 15:
+        raise RuntimeError('Missing checkpoint keys')
+    comparisons = []
+    lookup = {phase_c_key(r): r for r in rows}
+    for left, right in [('pristine', 'vanilla_eq'), ('phase2b', 'vanilla_eq'), ('final', 'phase2a')]:
+        mismatches, deltas = 0, []
+        for qid in range(3):
+            a, b = lookup[(left, 16, 0, qid)], lookup[(right, 16, 0, qid)]
+            mismatches += int(a['result_ids'] != b['result_ids'])
+            deltas.append(a['recall_at_10'] - b['recall_at_10'])
+        comparisons.append({'left': left, 'right': right, 'top10_mismatch': mismatches, 'recall_deltas': deltas})
+    interrupted = root / 'phase_c_interruption.json'
+    resume_pass = args.resume and interrupted.exists() and bool(resume_before) and not (set(resume_before) & set(executed)) and set(resume_before) | set(executed) == expected
+    report = {'decision': 'PASS' if resume_pass and all(c['top10_mismatch'] == 0 and all(d == 0 for d in c['recall_deltas']) for c in comparisons) else 'FAIL',
+              'ground_truth': json.loads((root / 'ground_truth_verification.json').read_text()),
+              'mapping': mapping, 'comparisons': comparisons, 'rows': len(rows),
+              'resume': {'status': 'PASS' if resume_pass else 'FAIL', 'previous_keys': resume_before,
+                         'executed_keys': executed, 'duplicates': 0, 'missing': 0, 'active_binary_revalidated': True},
+              'index': manifest['index'], 'part2_executed': False}
+    write_json_atomic(root / 'phase_c_smoke_plans.json', plans)
+    write_json_atomic(root / 'phase_c_part1_report.json', report)
+    write_csv(root / 'phase_c_smoke_raw.csv', [{**r, 'result_ids': json.dumps(r['result_ids'])} for r in rows])
+    if report['decision'] != 'PASS':
+        raise RuntimeError('Part 1 validation failed; formal benchmark forbidden')
+    print('PASS: Phase C infrastructure validated; Part 2 was not run.', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -1878,6 +1904,8 @@ def main():
     run.add_argument("--unsupported-queries", type=int, default=10)
     run.add_argument("--output", type=Path)
     run.add_argument("--resume", action="store_true")
+    run.add_argument("--part1", action="store_true", help="Run only Phase C infrastructure smoke")
+    run.add_argument("--stop-after", type=int, default=0, help="Interrupt after N durable smoke rows, exit 75")
     run.add_argument("--verify-ground-truth", action="store_true")
     run.add_argument("--ground-truth-queries", type=int, default=20)
     args = parser.parse_args()
@@ -1885,6 +1913,8 @@ def main():
         build_indexes(args)
     else:
         validate_phase2b_options(args)
+        if args.phase == "formal":
+            validate_phase_c_options(args)
         if args.validate_only:
             print("run options valid")
             return

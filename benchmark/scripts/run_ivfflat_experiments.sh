@@ -23,9 +23,13 @@ if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}
 fi
 
 RESUME_RUN_DIR=
+FOREGROUND=0
 WORKER_ARGS=()
 while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--resume" ]]; then
+    if [[ "$1" == "--foreground" ]]; then
+        FOREGROUND=1
+        shift
+    elif [[ "$1" == "--resume" ]]; then
         if [[ "${PHASE}" != "formal" || $# -lt 2 ]]; then
             echo "--resume requires: formal --resume RUN_DIR" >&2
             exit 2
@@ -65,6 +69,16 @@ else
     mkdir -p "${RUN_DIR}"
 fi
 LOG_FILE="${RUN_DIR}/experiment.log"
+
+# Foreground mode is useful for supervised sessions and reproducible interruption tests.
+if [[ "${FOREGROUND}" == "1" ]]; then
+    echo "run directory: ${RUN_DIR}"
+    echo "log: ${LOG_FILE}"
+    exec env BENCHMARK_ROOT="${BENCHMARK_ROOT}" \
+        BENCHMARK_RUNTIME_ROOT="${BENCHMARK_RUNTIME_ROOT}" RUN_ROOT="${RUN_ROOT}" \
+        RUN_DIR="${RUN_DIR}" PID_FILE="${PID_FILE}" PYTHON_BIN="${PYTHON_BIN}" \
+        "${WORKER}" "${PHASE}" "${WORKER_ARGS[@]}" >>"${LOG_FILE}" 2>&1
+fi
 
 nohup env \
     BENCHMARK_ROOT="${BENCHMARK_ROOT}" \

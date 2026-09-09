@@ -79,10 +79,10 @@ PHASE2B_PRODUCTION_WARMUP=${PHASE2B_PRODUCTION_WARMUP:-100}
 PHASE2B_PRODUCTION_QUERIES=${PHASE2B_PRODUCTION_QUERIES:-1000}
 PHASE2B_PRODUCTION_PROBES=${PHASE2B_PRODUCTION_PROBES:-16,64,128}
 PHASE2B_PRODUCTION_ROUNDS=${PHASE2B_PRODUCTION_ROUNDS:-4}
-FORMAL_WARMUP=${FORMAL_WARMUP:-100}
-FORMAL_QUERIES=${FORMAL_QUERIES:-10000}
-FORMAL_PROBES=${FORMAL_PROBES:-1,2,4,8,16,32,64,128,256}
-FORMAL_DATASET=${FORMAL_DATASET:-glove-cosine}
+FORMAL_WARMUP=${FORMAL_WARMUP:-1}
+FORMAL_QUERIES=${FORMAL_QUERIES:-3}
+FORMAL_PROBES=${FORMAL_PROBES:-16}
+FORMAL_DATASET=${FORMAL_DATASET:-gist-l2}
 for formal_arg_index in "${!FORMAL_ARGS[@]}"; do
     argument=${FORMAL_ARGS[formal_arg_index]}
     if [[ "${argument}" == "--dataset" ]]; then
@@ -247,6 +247,16 @@ if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${PHASE2B_RUN_ARGS[@]}" --validate-only
     printf '%q ' "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${PHASE2B_RUN_ARGS[@]}" >"${RUN_DIR}/run-command.txt"
     printf '\n' >>"${RUN_DIR}/run-command.txt"
+fi
+
+# Phase C owns builds, safe activation, the shared index, and durable resume.
+# Defaults are strictly Part 1; the Python guard refuses a formal-sized workload.
+if [[ "${PHASE}" == "formal" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run \
+        --phase formal --part1 --dataset gist-l2 --queries 3 --warmup 1 \
+        --rounds 1 --probes-list 16 --lists 1000 --topk 10 \
+        --output "${RUN_DIR}/phase_c_artifacts" "${FORMAL_ARGS[@]}"
+    exit 0
 fi
 
 PROFILE_BUILD_ARGS=()
