@@ -1,0 +1,115 @@
+{
+  "phase": "D-0A",
+  "name": "Metric-Aware Safe Page Pruning Semantic Audit",
+  "status": "COMPLETE",
+  "scope": "SOURCE_AUDIT_AND_MATHEMATICAL_DESIGN_ONLY",
+  "decision": "SOURCE_SEMANTICS_AND_REAL_ARITHMETIC_BOUNDS_SUPPORTED; PRODUCTION_FLOATING_POINT_AND_EXECUTOR_SAFETY_NOT_YET_CERTIFIED",
+  "completed_at_utc": "2026-09-10T13:51:28.431404+00:00",
+  "repository_head": "47e2b9b035a4ac0c9dcbd228272e1eca941c5f5e",
+  "production_binary": "/workspace/install/lib/postgresql/vector.so",
+  "production_binary_sha256": "d56dffd4db4e08d075cad229da5b04a7dc722f1d2cd45f03fb5570b0a64f6480",
+  "production_source_commit": "6dab3886aa18a194f3cb955ad6c8c6addd8d7a8c",
+  "D0A_RQ1": {
+    "metric": "L2",
+    "real_arithmetic_safe_bound": true,
+    "bound": "max(0,Rmin-d,d-Rmax)^2",
+    "production_floating_point_certified": false
+  },
+  "D0A_RQ2": {
+    "metric": "IP",
+    "real_arithmetic_safe_bound": true,
+    "bound": "-(q.dot(c)+norm(q)*Rmax)",
+    "production_floating_point_certified": false
+  },
+  "D0A_RQ3": {
+    "metric": "Cosine",
+    "actual_internal_score": "negative dot of actual rounded-normalized stored/query vectors",
+    "internal_key_real_arithmetic_safe_bound": true,
+    "requires_exact_unit_norm": false,
+    "direct_sql_cosine_operator_bound": "NEEDS_ADDITIONAL_METADATA",
+    "production_floating_point_certified": false
+  },
+  "D0A_RQ4": {
+    "shared_framework": true,
+    "shared_residual_metadata_schema": true,
+    "reuse_metadata_values_across_opclasses": false,
+    "metric_specific_computation": true
+  },
+  "D0A_RQ5": {
+    "L2": "Rmax upper enclosure; add Rmin lower enclosure for shell bound",
+    "IP": "Rmax upper enclosure",
+    "Cosine_internal_key": "Rmax of actual rounded-normalized x minus actual stored center",
+    "common": "representation/index/list/page/centroid-generation identity, coverage validity, numerical certificate",
+    "Cosine_direct_SQL_operator": "norm intervals plus normalization-direction and kernel rounding certificates, or separately certified original-direction enclosure; not implemented"
+  },
+  "D0A_RQ6": {
+    "source_confirmed": [
+      "opclass procs",
+      "build/sample/query normalization",
+      "stored representation",
+      "list and candidate scoring",
+      "distance/TID comparator",
+      "bounded/fallback and MVCC boundary"
+    ],
+    "mathematically_derived": [
+      "L2 residual shell lower bound",
+      "IP residual similarity upper bound",
+      "Cosine stored-space negative-IP lower bound",
+      "strict tie-safe pruning under certified threshold qualification"
+    ],
+    "not_validated": [
+      "actual binary uniform floating-point error bounds",
+      "metadata consistency and pre-page access",
+      "SQL-qualified threshold and fallback integration",
+      "production pruning correctness",
+      "pruning potential",
+      "performance"
+    ]
+  },
+  "numerical_policy": "UNKNOWN_OR_UNCERTIFIED_BOUND_MEANS_DO_NOT_PRUNE",
+  "invariants": {
+    "production_binary_unchanged": true,
+    "four_protected_source_files_unchanged": true,
+    "production_source_tree_diff_empty": true,
+    "phase_c_snapshotted_files_unchanged": true,
+    "phase_c_verified_regular_files": 206,
+    "old_phase_c_pid_absent": true,
+    "page_format_changed": false,
+    "pruning_implemented_in_D0A": false,
+    "fused2_optimized": false,
+    "d0a_sql_queries": 0,
+    "d0a_smoke_queries": 0,
+    "d0a_benchmarks": 0,
+    "d0b_started": false
+  },
+  "old_preparation_archive": "/workspace/benchmark/retired/phase_d0_pre_d0a_20260910T130433Z",
+  "old_preparation_status": "SUPERSEDED; independent build and one synthetic selftest only; no GIST validation run",
+  "source_hashes": {
+    "contrib/pgvector/sql/vector.sql": "7fb5bb279ef83bf9204bfac7405bb5c9a05e49f5ac7d64d1eb4464d103b80f32",
+    "contrib/pgvector/src/ivfbuild.c": "767ca565b6a8c62a684424f58ceaa4f356d97d087b2d84b96d09a8bc90dd835d",
+    "contrib/pgvector/src/ivfflat.h": "7cc329609465d947c567093d9a270cc4e9a06b320d29d151240043b40873c7aa",
+    "contrib/pgvector/src/ivfinsert.c": "41df35c597ebf4e7f3a4feb8dd0bb2da615a4d61ed07dd1191e3b469b4dbf279",
+    "contrib/pgvector/src/ivfkmeans.c": "7aefce174af9c02ad7c2aa0991247b266c9455090704092f13f743595b98f97d",
+    "contrib/pgvector/src/ivfscan.c": "6441422bfae2081cdb2486caea5b17daa269dcb07983a5b0efffb9081699378b",
+    "contrib/pgvector/src/ivfutils.c": "db4d7bc6d34343032ecd456ee253e2865ad15e3bf272684c1671dbf33e3b998e",
+    "contrib/pgvector/src/ivfvacuum.c": "edaea787a49f9b6c00b861cbf3d83ede93b2016bd3daa7aee2cf997f44ca74f4",
+    "contrib/pgvector/src/vector.c": "715968cff3340551fbf9d17b151f0986f76273e9734dd418035e1e4cfc553d5e",
+    "contrib/pgvector/src/vector.h": "74e32b744e97db4f2d3f9d2db1c1562a6ebc79a42fe581b5ee7fbbb2f4c2ab67",
+    "src/backend/access/index/indexam.c": "03734740a8982c289a05e64d086bc54b34baa45896b4491251765a9a7ea5c67e",
+    "src/backend/executor/execProcnode.c": "5b15502f43a74ddc380ff86fdfa6371d4370d2ad47c8d4aafd6c8e79d85a0f2d",
+    "src/backend/executor/nodeIndexscan.c": "6ff40fbdb12d06e408468e6819c4dc906422b54ce6072dd91862678918d33e8f",
+    "src/backend/executor/nodeLimit.c": "f4c202d7182d66c6bef222fa50439831691dd99bfa5fd6b4de7f9142635dc305",
+    "src/backend/storage/page/itemptr.c": "0cccf1dfd483e8adbb87fefb072bdb00cc3393b6f1a50d52b03ff30f16cd828d",
+    "src/include/access/itup.h": "fbd4d55559fe34fe5ccd00913a42230f83f5c86317931dee10e8aec6f2e7b9de",
+    "src/include/storage/bufpage.h": "d750f101a40a4b161fb91884c9fd66aec22484d14711776764cb5c65fa98ac9e"
+  },
+  "git_status": "M benchmark/scripts/ivfflat_profile.py\n M benchmark/scripts/run_ivfflat_experiments_worker.sh\n M benchmark/tests/test_phase_c_runner.py\n?? benchmark/docs/phase_c_part2.md\n?? benchmark/docs/phase_d0a/phase_d0a_bound_derivation.md\n?? benchmark/docs/phase_d0a/phase_d0a_decision.json\n?? benchmark/docs/phase_d0a/phase_d0a_metric_table.csv\n?? benchmark/docs/phase_d0a/phase_d0a_semantic_audit.md\n?? benchmark/docs/phase_d0a/phase_d0a_source_map.txt\n?? benchmark/docs/phase_d0a/preparation_archive.txt",
+  "deliverables": [
+    "phase_d0a_semantic_audit.md",
+    "phase_d0a_metric_table.csv",
+    "phase_d0a_bound_derivation.md",
+    "phase_d0a_source_map.txt",
+    "phase_d0a_decision.json"
+  ],
+  "stop_after_this_stage": true
+}

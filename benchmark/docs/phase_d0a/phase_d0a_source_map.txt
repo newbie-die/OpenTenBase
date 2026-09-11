@@ -1,0 +1,70 @@
+Phase D-0A source map
+Repository: /workspace/OpenTenBase
+HEAD: 47e2b9b035a4ac0c9dcbd228272e1eca941c5f5e
+Production source: 6dab3886aa18a194f3cb955ad6c8c6addd8d7a8c
+Format: reference | file:function:line-range | finding
+
+S01 | contrib/pgvector/sql/vector.sql:vector_l2_ops / vector_ip_ops / vector_cosine_ops (USING ivfflat):292-311 | 三种 opclass 的 support proc 1/2/3/4，区别 HNSW
+S02 | contrib/pgvector/sql/vector.sql:CREATE OPERATOR <-> / <#> / <=>:174-186 | SQL operator 实现
+S03 | contrib/pgvector/src/ivfflat.h:support proc constants:45-49 | DISTANCE=1,NORM=2,KMEANS_DISTANCE=3,KMEANS_NORM=4,TYPE_INFO=5
+S04 | contrib/pgvector/src/ivfbuild.c:ComputeCenters:435-480 | lists*50，最少10000，受可用 tuple 数约束；采样后聚类
+S05 | contrib/pgvector/src/ivfbuild.c:AddSample / SampleRows:57-155 | IP/Cosine proc4 控制样本可归一化检查与归一化
+S06 | contrib/pgvector/src/ivfkmeans.c:InitCenters:24-91 | kmeans++，使用 proc3
+S07 | contrib/pgvector/src/ivfkmeans.c:ComputeNewCenters:180-235 | 样本均值、空中心随机填充、可选中心归一化
+S08 | contrib/pgvector/src/ivfkmeans.c:ElkanKmeans:239-480 | L2 非平方距离或 angular distance；迭代更新中心
+S09 | contrib/pgvector/src/ivfkmeans.c:RandomCenters:111-133 | 无样本时随机中心并按 proc4 归一化；入口与校验见 S42-S44
+S10 | contrib/pgvector/src/ivfbuild.c:AddTupleToSort:162-218 | proc2 控制实际存储值归一化；proc1 选择最小距离的 list；support 初始化368-372
+S11 | contrib/pgvector/src/ivfbuild.c:GetNextTuple / InsertTuples:250-331 | entry tuple=value+heap TID；按 list 打包进链式 entry pages
+S12 | contrib/pgvector/src/ivfbuild.c:CreateMetaPage / CreateListPages:486-556 | meta 字段；list 中心、startPage、insertPage
+S13 | contrib/pgvector/src/ivfbuild.c:CreateEntryPages / BuildIndex:1018-1058 | build 执行顺序
+S14 | contrib/pgvector/src/ivfflat.h:IvfflatMetaPageData / IvfflatPageOpaqueData / IvfflatListData:272-299 | 无 residual metadata；nextblkno 位于页尾
+S15 | contrib/pgvector/src/vector.h:Vector:13-24 | varlena、dimension、float32 坐标
+S16 | src/include/access/itup.h:IndexTupleData:23-51 | heap TID、t_info 和后续属性数据
+S17 | src/include/storage/bufpage.h:slotted page layout:25-78 | PageHeader、line pointers、tuples、special space
+S18 | contrib/pgvector/src/ivfutils.c:IvfflatInitPage / IvfflatAppendPage:147-202 | PageInit、页尾 nextblkno、WAL 追加链
+S19 | contrib/pgvector/src/ivfutils.c:IvfflatOptionalProcInfo / IvfflatNormValue / IvfflatCheckNorm / IvfflatNormVectors:71-115 | proc 不存在返回 NULL；normalize 实际调用 typeInfo
+S20 | contrib/pgvector/src/ivfutils.c:VectorUpdateCenter / VectorSumCenter / IvfflatGetTypeInfo:301-389 | float32 中心；vector normalize=l2_normalize
+S21 | contrib/pgvector/src/vector.c:VectorL2SquaredDistanceRaw / l2_distance / vector_l2_squared_distance:561-633 | float32 reduction；SQL sqrt；内部不 sqrt
+S22 | contrib/pgvector/src/vector.c:VectorInnerProduct / vector_negative_inner_product:636-675 | float32 dot；取负后提升为 float8
+S23 | contrib/pgvector/src/vector.c:VectorCosineSimilarity / cosine_distance:678-724 | raw dot、norm 累加、除范数、clamp、1-similarity
+S24 | contrib/pgvector/src/vector.c:vector_spherical_distance:733-750 | 假定 unit，clamp(dot)，acos/pi；只用于聚类 proc3
+S25 | contrib/pgvector/src/vector.c:vector_norm / l2_normalize:797-847 | double norm，float32 normalization 输出，zero 返回 zero
+S26 | contrib/pgvector/src/ivfscan.c:GetScanValue / ZeroDistance:430-492 | proc2 query normalization；NULL key ZeroDistance；direct/FUSED2 eligibility
+S27 | contrib/pgvector/src/ivfscan.c:CompareLists / GetScanLists:70-155 | proc1 selected-list 排序；list ties 不使用 TID
+S28 | contrib/pgvector/src/ivfscan.c:GetScanItems:161-424 | 完整 page/candidate 遍历，generic proc1 328；sort input 362；sort finalize 405
+S29 | contrib/pgvector/src/ivfscan.c:InitScanSortState:498-512 | float8 distance ASC + TID ASC，full/bounded 同语义
+S30 | contrib/pgvector/src/ivfscan.c:ivfflatbeginscan:574-665 | maxProbes、support proc、dimension、sort descriptor
+S31 | contrib/pgvector/src/ivfscan.c:ivfflatrescan:707-761 | logicalBound、physicalBound、iterative off eligibility、重置
+S32 | contrib/pgvector/src/ivfscan.c:StartFullSortFallback / ReturnedFromBounded / RememberBoundedTid:518-568 | 重扫同一 selected list set、unbounded sort、TID 去重
+S33 | contrib/pgvector/src/ivfscan.c:ivfflatgettuple:767-884 | MVCC snapshot、full scan 后返回；bounded exhaustion fallback；不 recheckorderby
+S34 | src/backend/executor/nodeLimit.c:recompute_limits / compute_tuples_needed:417-437 | LIMIT+OFFSET；WITH TIES/noCount 不传播有限 bound
+S35 | src/backend/executor/execProcnode.c:ExecSetTupleBound:903-908 | 传给 IndexScanState.iss_TupleBound
+S36 | src/backend/executor/nodeIndexscan.c:IndexNext:103-152 | scan bound 传入 AM；取 heap tuple 后 recheck
+S37 | src/backend/access/index/indexam.c:index_fetch_heap:680-706 | MVCC 取 heap tuple；index candidate 不等于 visible SQL row
+S38 | src/backend/executor/nodeIndexscan.c:ExecIndexScan:523-541 | ExecScan 执行过滤/投影
+S39 | src/backend/storage/page/itemptr.c:ItemPointerCompare:51-72 | block number，再 offset；不是 application ID
+S40 | contrib/pgvector/src/ivfinsert.c:FindInsertPage / InsertTuple:20-180 | 增量 normalize、list assignment、追加页、WAL
+S41 | contrib/pgvector/src/ivfvacuum.c:ivfflatbulkdelete (page deletion fragment):85-135 | 删除 tuple、复用空闲页；metadata 生命周期要求
+S42 | contrib/pgvector/src/ivfkmeans.c:IvfflatKmeans:554-570 | 无样本随机中心，否则 Elkan；CheckCenters
+S43 | contrib/pgvector/src/ivfkmeans.c:CheckCenters:540-547 | 中心数量、finite 元素和 norm 校验
+S44 | contrib/pgvector/src/ivfkmeans.c:CheckNorms:518-534 | 只有 proc2 存在时检查中心非零；IP 无此检查
+S45 | contrib/pgvector/src/ivfbuild.c:InitBuildState (support initialization):368-372 | proc1、proc2、proc4 初始化
+
+SHA256 of audited source files:
+7fb5bb279ef83bf9204bfac7405bb5c9a05e49f5ac7d64d1eb4464d103b80f32  contrib/pgvector/sql/vector.sql
+767ca565b6a8c62a684424f58ceaa4f356d97d087b2d84b96d09a8bc90dd835d  contrib/pgvector/src/ivfbuild.c
+7cc329609465d947c567093d9a270cc4e9a06b320d29d151240043b40873c7aa  contrib/pgvector/src/ivfflat.h
+41df35c597ebf4e7f3a4feb8dd0bb2da615a4d61ed07dd1191e3b469b4dbf279  contrib/pgvector/src/ivfinsert.c
+7aefce174af9c02ad7c2aa0991247b266c9455090704092f13f743595b98f97d  contrib/pgvector/src/ivfkmeans.c
+6441422bfae2081cdb2486caea5b17daa269dcb07983a5b0efffb9081699378b  contrib/pgvector/src/ivfscan.c
+db4d7bc6d34343032ecd456ee253e2865ad15e3bf272684c1671dbf33e3b998e  contrib/pgvector/src/ivfutils.c
+edaea787a49f9b6c00b861cbf3d83ede93b2016bd3daa7aee2cf997f44ca74f4  contrib/pgvector/src/ivfvacuum.c
+715968cff3340551fbf9d17b151f0986f76273e9734dd418035e1e4cfc553d5e  contrib/pgvector/src/vector.c
+74e32b744e97db4f2d3f9d2db1c1562a6ebc79a42fe581b5ee7fbbb2f4c2ab67  contrib/pgvector/src/vector.h
+03734740a8982c289a05e64d086bc54b34baa45896b4491251765a9a7ea5c67e  src/backend/access/index/indexam.c
+5b15502f43a74ddc380ff86fdfa6371d4370d2ad47c8d4aafd6c8e79d85a0f2d  src/backend/executor/execProcnode.c
+6ff40fbdb12d06e408468e6819c4dc906422b54ce6072dd91862678918d33e8f  src/backend/executor/nodeIndexscan.c
+f4c202d7182d66c6bef222fa50439831691dd99bfa5fd6b4de7f9142635dc305  src/backend/executor/nodeLimit.c
+0cccf1dfd483e8adbb87fefb072bdb00cc3393b6f1a50d52b03ff30f16cd828d  src/backend/storage/page/itemptr.c
+fbd4d55559fe34fe5ccd00913a42230f83f5c86317931dee10e8aec6f2e7b9de  src/include/access/itup.h
+d750f101a40a4b161fb91884c9fd66aec22484d14711776764cb5c65fa98ac9e  src/include/storage/bufpage.h

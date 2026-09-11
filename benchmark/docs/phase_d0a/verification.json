@@ -1,0 +1,19 @@
+{
+  "status": "PASS",
+  "deliverable_count": 5,
+  "metric_rows": 3,
+  "source_links_valid": true,
+  "source_references": 45,
+  "formal_queries": 0,
+  "smoke_queries": 0,
+  "production_unchanged": true,
+  "phase_c_unchanged": true,
+  "d0b_started": false,
+  "sha256": {
+    "phase_d0a_semantic_audit.md": "cdbcdda913451ec17dea9de339fc29a6717715cf2dfed89551fe70337f04806a",
+    "phase_d0a_metric_table.csv": "4b86285a5e29fe4da4fdc64c928641526cd6b2db02f55d580a0f00e690155276",
+    "phase_d0a_bound_derivation.md": "77e973e3824d7c6dca8ba9be339fb5dbbed3946b47fa6c27e20667f7a4726181",
+    "phase_d0a_source_map.txt": "a91d27cc80a6f450bc37c4b760b6020d62fe7ff43b06c796f1efaa5837cb79da",
+    "phase_d0a_decision.json": "6a1b1629f3a55e59c87cdd605335e6f00a18c51f1269b7406d1c2b2367ab02a7"
+  }
+}
