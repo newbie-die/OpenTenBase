@@ -1,0 +1,35 @@
+{
+  "average_candidates": 134170.778,
+  "average_probes": 64.0,
+  "fixed64_recall": 0.9795,
+  "mean_recall": 0.9795,
+  "p_static": 64,
+  "recall_delta": 0.0,
+  "target_recall": 0.9745,
+  "tested_probes": [
+    {
+      "mean_recall": 0.8366,
+      "probes": 16
+    },
+    {
+      "mean_recall": 0.932,
+      "probes": 32
+    },
+    {
+      "mean_recall": 0.952,
+      "probes": 40
+    },
+    {
+      "mean_recall": 0.9635,
+      "probes": 48
+    },
+    {
+      "mean_recall": 0.9726,
+      "probes": 56
+    },
+    {
+      "mean_recall": 0.9795,
+      "probes": 64
+    }
+  ]
+}

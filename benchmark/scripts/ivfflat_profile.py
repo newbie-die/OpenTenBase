@@ -1347,7 +1347,14 @@ def run_experiment(args):
     if args.phase != "formal":
         with conn.cursor() as cur:
             cur.execute("SET client_min_messages = info")
-    if args.phase == "formal":
+    if args.phase == "all-fomal-exp":
+        import sys
+        d2p_path = str(Path(__file__).resolve().parents[1] / "d2p")
+        if d2p_path not in sys.path:
+            sys.path.insert(0, d2p_path)
+        from formal_runner import run as run_d2p_formal
+        run_d2p_formal(conn, args)
+    elif args.phase == "formal":
         run_formal(conn, args)
     elif args.phase == "2b-production":
         run_phase2b_production(conn, args)
@@ -2191,7 +2198,7 @@ def main():
     build.add_argument("--lists", type=int, default=1000)
     build.add_argument("--output", type=Path)
     run = commands.add_parser("run")
-    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "2b", "2b-correctness", "2b-production", "formal"), required=True)
+    run.add_argument("--phase", choices=("a", "b", "2a", "2a2", "2a34", "2b", "2b-correctness", "2b-production", "formal", "all-fomal-exp"), required=True)
     run.add_argument("--dataset", choices=tuple(FORMAL_DATASET_LABELS), default="glove-cosine")
     run.add_argument("--warmup", "--warmup-queries", dest="warmup", type=int, default=100)
     run.add_argument("--queries", type=int, default=1000)
@@ -2228,6 +2235,13 @@ def main():
         if args.phase == "formal":
             validate_phase_c_options(args)
         if args.validate_only:
+            if args.phase == "all-fomal-exp":
+                import sys
+                d2p_path = str(Path(__file__).resolve().parents[1] / "d2p")
+                if d2p_path not in sys.path:
+                    sys.path.insert(0, d2p_path)
+                from formal_runner import validate_holdout
+                validate_holdout(args.output)
             print("run options valid")
             return
         run_experiment(args)

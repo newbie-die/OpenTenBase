@@ -1,0 +1,227 @@
+{
+  "calibration_qid_range": [
+    0,
+    999
+  ],
+  "class_weight": null,
+  "fold": "query_id % 5",
+  "go_vs_static": true,
+  "max_depth": 3,
+  "min_samples_leaf": 40,
+  "model": "DecisionTreeClassifier",
+  "oof_metrics": {
+    "average_candidates": 103714.192,
+    "average_distance_calls": 103714.192,
+    "average_pages": 51870.234,
+    "average_probes": 50.88,
+    "baseline_recall": 0.9795,
+    "distribution": {
+      "16": 100,
+      "32": 260,
+      "64": 640
+    },
+    "mean_recall": 0.9747,
+    "recall_delta": -0.0048000000000000265
+  },
+  "p_static": 64,
+  "seed": 20260913,
+  "stage16_features": [
+    "d1",
+    "d2",
+    "d4",
+    "d8",
+    "d16",
+    "d32",
+    "d64",
+    "d2_d1",
+    "d4_d1",
+    "d8_d1",
+    "d16_d1",
+    "d32_d1",
+    "d64_d1",
+    "d32_d16",
+    "d64_d32",
+    "gap",
+    "gap32_16_d1",
+    "gap64_32_d1",
+    "s16_top10_min",
+    "s16_top10_mean",
+    "s16_top10_std",
+    "s16_top10_max",
+    "s16_top10_spread",
+    "s16_candidates",
+    "s16_pages",
+    "s16_replacements",
+    "s16_replacement_rate",
+    "s16_candidates_per_page"
+  ],
+  "stage16_threshold": 0.95,
+  "stage16_tree": {
+    "feature": "d32_d1",
+    "if_gt": {
+      "feature": "d64_d1",
+      "if_gt": {
+        "feature": "d4_d1",
+        "if_gt": {
+          "safe_probability": 1.0,
+          "samples": 84
+        },
+        "if_le": {
+          "safe_probability": 0.9,
+          "samples": 40
+        },
+        "threshold": 1.2957057356834412
+      },
+      "if_le": {
+        "feature": "s16_replacement_rate",
+        "if_gt": {
+          "safe_probability": 0.6346153846153846,
+          "samples": 104
+        },
+        "if_le": {
+          "safe_probability": 0.8809523809523809,
+          "samples": 42
+        },
+        "threshold": 0.00501527008600533
+      },
+      "threshold": 2.12930166721344
+    },
+    "if_le": {
+      "feature": "d32_d1",
+      "if_gt": {
+        "feature": "s16_pages",
+        "if_gt": {
+          "safe_probability": 0.4787234042553192,
+          "samples": 94
+        },
+        "if_le": {
+          "safe_probability": 0.2910662824207493,
+          "samples": 347
+        },
+        "threshold": 21184.0
+      },
+      "if_le": {
+        "feature": "d64_d1",
+        "if_gt": {
+          "safe_probability": 0.1164021164021164,
+          "samples": 189
+        },
+        "if_le": {
+          "safe_probability": 0.0,
+          "samples": 100
+        },
+        "threshold": 1.3067447543144226
+      },
+      "threshold": 1.294619083404541
+    },
+    "threshold": 1.5485947728157043
+  },
+  "stage32_features": [
+    "d1",
+    "d2",
+    "d4",
+    "d8",
+    "d16",
+    "d32",
+    "d64",
+    "d2_d1",
+    "d4_d1",
+    "d8_d1",
+    "d16_d1",
+    "d32_d1",
+    "d64_d1",
+    "d32_d16",
+    "d64_d32",
+    "gap",
+    "gap32_16_d1",
+    "gap64_32_d1",
+    "s16_top10_min",
+    "s16_top10_mean",
+    "s16_top10_std",
+    "s16_top10_max",
+    "s16_top10_spread",
+    "s16_candidates",
+    "s16_pages",
+    "s16_replacements",
+    "s16_replacement_rate",
+    "s16_candidates_per_page",
+    "s32_top10_min",
+    "s32_top10_mean",
+    "s32_top10_std",
+    "s32_top10_max",
+    "s32_top10_spread",
+    "s32_candidates",
+    "s32_pages",
+    "s32_replacements",
+    "s32_replacement_rate",
+    "s32_candidates_per_page",
+    "top10_overlap_16_32",
+    "top10_replaced_16_32",
+    "kth10_relative_change_16_32",
+    "mean10_relative_change_16_32",
+    "candidate_growth_16_32"
+  ],
+  "stage32_threshold": 0.8504672897196262,
+  "stage32_tree": {
+    "feature": "d64_d1",
+    "if_gt": {
+      "feature": "d64_d1",
+      "if_gt": {
+        "feature": "kth10_relative_change_16_32",
+        "if_gt": {
+          "safe_probability": 0.875,
+          "samples": 40
+        },
+        "if_le": {
+          "safe_probability": 0.9829059829059829,
+          "samples": 234
+        },
+        "threshold": 0.0027708339039236307
+      },
+      "if_le": {
+        "feature": "s32_replacement_rate",
+        "if_gt": {
+          "safe_probability": 0.6696428571428571,
+          "samples": 112
+        },
+        "if_le": {
+          "safe_probability": 0.8394160583941606,
+          "samples": 137
+        },
+        "threshold": 0.0035484861582517624
+      },
+      "threshold": 1.7157695889472961
+    },
+    "if_le": {
+      "feature": "gap64_32_d1",
+      "if_gt": {
+        "feature": "d16",
+        "if_gt": {
+          "safe_probability": 0.75,
+          "samples": 76
+        },
+        "if_le": {
+          "safe_probability": 0.5021097046413502,
+          "samples": 237
+        },
+        "threshold": 1.6238608360290527
+      },
+      "if_le": {
+        "feature": "s32_top10_std",
+        "if_gt": {
+          "safe_probability": 0.6363636363636364,
+          "samples": 44
+        },
+        "if_le": {
+          "safe_probability": 0.275,
+          "samples": 120
+        },
+        "threshold": 0.06327231600880623
+      },
+      "threshold": 0.09100430831313133
+    },
+    "threshold": 1.5021027326583862
+  },
+  "target_recall": 0.9745,
+  "version": "D2-P"
+}

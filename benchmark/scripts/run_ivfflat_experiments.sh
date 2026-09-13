@@ -17,8 +17,8 @@ if [[ $# -gt 0 ]]; then
     shift
 fi
 
-if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && "${PHASE}" != "formal" ]]; then
-    echo "usage: $0 [all|a|b|2a|2a2|2a34|2b|2b-correctness|2b-production|formal] [phase options]" >&2
+if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && "${PHASE}" != "formal" && "${PHASE}" != "all-fomal-exp" ]]; then
+    echo "usage: $0 [all|a|b|2a|2a2|2a34|2b|2b-correctness|2b-production|formal|all-fomal-exp] [phase options]" >&2
     exit 2
 fi
 
@@ -30,8 +30,8 @@ while [[ $# -gt 0 ]]; do
         FOREGROUND=1
         shift
     elif [[ "$1" == "--resume" ]]; then
-        if [[ "${PHASE}" != "formal" || $# -lt 2 ]]; then
-            echo "--resume requires: formal --resume RUN_DIR" >&2
+        if [[ ( "${PHASE}" != "formal" && "${PHASE}" != "all-fomal-exp" ) || $# -lt 2 ]]; then
+            echo "--resume requires: formal|all-fomal-exp --resume RUN_DIR" >&2
             exit 2
         fi
         RESUME_RUN_DIR=$2
@@ -42,7 +42,7 @@ while [[ $# -gt 0 ]]; do
         shift
     fi
 done
-if [[ "${PHASE}" != "formal" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && ${#WORKER_ARGS[@]} -gt 0 ]]; then
+if [[ "${PHASE}" != "formal" && "${PHASE}" != "all-fomal-exp" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && ${#WORKER_ARGS[@]} -gt 0 ]]; then
     echo "additional CLI options are supported only for formal and Phase 2B modes" >&2
     exit 2
 fi
@@ -65,7 +65,11 @@ if [[ -n "${RESUME_RUN_DIR}" ]]; then
     RUN_DIR=$(cd -- "${RESUME_RUN_DIR}" && pwd -P)
 else
     RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
-    RUN_DIR="${RUN_ROOT}/${RUN_ID}"
+    if [[ "${PHASE}" == "all-fomal-exp" ]]; then
+        RUN_DIR="${RUN_ROOT}/all_fomal_exp_${RUN_ID}"
+    else
+        RUN_DIR="${RUN_ROOT}/${RUN_ID}"
+    fi
     mkdir -p "${RUN_DIR}"
 fi
 LOG_FILE="${RUN_DIR}/experiment.log"

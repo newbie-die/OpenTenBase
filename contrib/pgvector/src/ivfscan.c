@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include <float.h>
+#include <math.h>
 
 #include "access/genam.h"
 #include "access/itup.h"
@@ -12,6 +13,7 @@
 #include "lib/pairingheap.h"
 #include "lib/stringinfo.h"
 #include "ivfflat.h"
+#include "ivfd2ppolicy.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -133,7 +135,8 @@ DebugOrderedLists(IvfflatScanOpaque so, int listCount)
 						 so->listPages[i], so->listDistances[i]);
 
 	elog(INFO, "IVFFLAT_PROGRESSIVE_LISTS mode=%s count=%d pages_distances=%s",
-		 so->progressiveShadow ? "shadow" : "fixed", listCount, lists.data);
+		 so->progressiveEarlyStop ? "on" : (so->progressiveShadow ? "shadow" : "fixed"),
+		 listCount, lists.data);
 	pfree(lists.data);
 }
 
@@ -668,9 +671,78 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	GetScanItemsRange(scan, value, startIndex, endIndex, true, true);
 }
 
-/* Shadow mode always completes 16 -> 32 -> 64 before tuplesort output. */
+/* Build only the frozen tree's low-cost fields from existing scan state. */
 static void
-GetProgressiveShadowItems(IndexScanDesc scan, Datum value)
+D2PBuildFeatures(IvfflatScanOpaque so, D2PFeatures *features, int stage)
+{
+	IvfflatShadowSnapshot *snapshot = stage == 16 ?
+		&so->shadowSnapshots[0] : &so->shadowSnapshots[1];
+	double		d1 = so->listDistances[0];
+	double		mean = 0;
+	double		variance = 0;
+
+	Assert(snapshot->count >= 10);
+	MemSet(features, 0, sizeof(*features));
+	features->d16 = so->listDistances[15];
+	if (d1 != 0)
+	{
+		features->d4_d1 = so->listDistances[3] / d1;
+		features->d32_d1 = so->listDistances[31] / d1;
+		features->d64_d1 = so->listDistances[63] / d1;
+		features->gap64_32_d1 =
+			(so->listDistances[63] - so->listDistances[31]) / d1;
+	}
+
+	features->s16_pages = (double) so->shadowSnapshots[0].pagesSeen;
+	if (so->shadowSnapshots[0].candidatesSeen > 0)
+		features->s16_replacement_rate =
+			(double) so->shadowSnapshots[0].replacements /
+			(double) so->shadowSnapshots[0].candidatesSeen;
+
+	if (stage == 32)
+	{
+		for (int i = 0; i < 10; i++)
+			mean += snapshot->items[i].distance;
+		mean /= 10.0;
+		for (int i = 0; i < 10; i++)
+		{
+			double		delta = snapshot->items[i].distance - mean;
+
+			variance += delta * delta;
+		}
+		features->s32_top10_std = sqrt(variance / 10.0);
+		if (snapshot->candidatesSeen > 0)
+			features->s32_replacement_rate =
+				(double) snapshot->replacements / (double) snapshot->candidatesSeen;
+		if (so->shadowSnapshots[0].items[9].distance != 0)
+			features->kth10_relative_change_16_32 =
+				(so->shadowSnapshots[0].items[9].distance - snapshot->items[9].distance) /
+				so->shadowSnapshots[0].items[9].distance;
+	}
+}
+
+static bool
+D2PShouldStop(IvfflatScanOpaque so, int stage)
+{
+	D2PFeatures features;
+	double		probability;
+
+	D2PBuildFeatures(so, &features, stage);
+	probability = stage == 16 ? D2PStage16SafeProbability(features) :
+		D2PStage32SafeProbability(features);
+	if (ivfflat_progressive_scan_debug)
+		elog(INFO, "IVFFLAT_PROGRESSIVE_POLICY stage=%d safe_probability=%.17g threshold=%.17g stop=%d",
+			 stage, probability,
+			 stage == 16 ? D2P_STAGE16_THRESHOLD : D2P_STAGE32_THRESHOLD,
+			 probability >= (stage == 16 ? D2P_STAGE16_THRESHOLD :
+								 D2P_STAGE32_THRESHOLD));
+	return probability >= (stage == 16 ? D2P_STAGE16_THRESHOLD :
+						   D2P_STAGE32_THRESHOLD);
+}
+
+/* Shadow completes all stages; on may finalize after the 16/32 snapshot. */
+static void
+GetProgressiveItems(IndexScanDesc scan, Datum value)
 {
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 
@@ -681,12 +753,28 @@ GetProgressiveShadowItems(IndexScanDesc scan, Datum value)
 
 	GetScanItemsRange(scan, value, 0, 16, true, false);
 	ShadowSnapshot(so, 0, 16);
+	if (so->progressiveEarlyStop && D2PShouldStop(so, 16))
+	{
+		so->probes = 16;
+		so->progressiveStopStage = 16;
+		GetScanItemsRange(scan, value, 16, 16, false, true);
+		return;
+	}
 	GetScanItemsRange(scan, value, 16, 32, false, false);
 	ShadowSnapshot(so, 1, 32);
+	if (so->progressiveEarlyStop && D2PShouldStop(so, 32))
+	{
+		so->probes = 32;
+		so->progressiveStopStage = 32;
+		GetScanItemsRange(scan, value, 32, 32, false, true);
+		return;
+	}
 	GetScanItemsRange(scan, value, 32, 64, false, true);
 	ShadowSnapshot(so, 2, 64);
+	so->probes = 64;
+	so->progressiveStopStage = 64;
 
-	if (so->shadowScannedLists != UINT64_MAX)
+	if (!so->progressiveEarlyStop && so->shadowScannedLists != UINT64_MAX)
 		elog(ERROR, "IVFFlat progressive shadow did not scan each of 64 lists exactly once");
 }
 
@@ -847,7 +935,9 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	int			probes = ivfflat_probes;
 	int			maxProbes;
 	bool		progressiveShadow =
-		ivfflat_progressive_scan == IVFFLAT_PROGRESSIVE_SCAN_SHADOW;
+		ivfflat_progressive_scan != IVFFLAT_PROGRESSIVE_SCAN_OFF;
+	bool		progressiveEarlyStop =
+		ivfflat_progressive_scan == IVFFLAT_PROGRESSIVE_SCAN_ON;
 	MemoryContext oldCtx;
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
@@ -859,16 +949,16 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	{
 		if (lists < 64)
 			ereport(ERROR,
-					(errmsg("ivfflat.progressive_scan=shadow requires an index with at least 64 lists")));
+					(errmsg("ivfflat progressive scan requires an index with at least 64 lists")));
 		if (ivfflat_iterative_scan != IVFFLAT_ITERATIVE_SCAN_OFF)
 			ereport(ERROR,
-					(errmsg("ivfflat.progressive_scan=shadow is incompatible with iterative_scan")));
+					(errmsg("ivfflat progressive scan is incompatible with iterative_scan")));
 		if (ivfflat_adaptive_probes)
 			ereport(ERROR,
-					(errmsg("ivfflat.progressive_scan=shadow is incompatible with adaptive_probes")));
+					(errmsg("ivfflat progressive scan is incompatible with adaptive_probes")));
 		if (ivfflat_experimental_sort_bound > 0 || ivfflat_bounded_scan)
 			ereport(ERROR,
-					(errmsg("ivfflat.progressive_scan=shadow is incompatible with bounded scan experiments")));
+					(errmsg("ivfflat progressive scan is incompatible with bounded scan experiments")));
 
 		/* Shadow semantics are fixed at 16 -> 32 -> 64. */
 		probes = 64;
@@ -895,6 +985,8 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->maxProbes = maxProbes;
 	so->dimensions = dimensions;
 	so->progressiveShadow = progressiveShadow;
+	so->progressiveEarlyStop = progressiveEarlyStop;
+	so->progressiveStopStage = 0;
 	so->shadowK = 0;
 	so->shadowCapacity = 0;
 	so->shadowTopCount = 0;
@@ -1024,7 +1116,7 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 		(ivfflat_iterative_scan != IVFFLAT_ITERATIVE_SCAN_OFF ||
 		 ivfflat_adaptive_probes || so->sortBound > 0 || ivfflat_bounded_scan))
 		ereport(ERROR,
-				(errmsg("ivfflat.progressive_scan=shadow cannot be combined with adaptive, iterative, or bounded scan modes")));
+				(errmsg("ivfflat progressive scan cannot be combined with adaptive, iterative, or bounded scan modes")));
 #ifdef IVFFLAT_DISTANCE_PATH
 	if (so->directQueryNeedsFree)
 		pfree(so->directQuery);
@@ -1058,6 +1150,7 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 	pairingheap_reset(so->listQueue);
 	so->listCount = 0;
 	so->listIndex = 0;
+	so->progressiveStopStage = 0;
 
 	if (so->progressiveShadow)
 	{
@@ -1179,7 +1272,7 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 		GetScanLists(scan, value);
 #endif
 		if (so->progressiveShadow)
-			GetProgressiveShadowItems(scan, value);
+			GetProgressiveItems(scan, value);
 		else
 			GetScanItems(scan, value);
 		so->first = false;
@@ -1282,8 +1375,8 @@ ivfflatendscan(IndexScanDesc scan)
 		 so->profile_sort_us, so->profile_return_us,
 		 so->profile_list_us + so->profile_getitems_us + so->profile_return_us);
 #ifdef IVFFLAT_PROFILE_2B
-	elog(INFO, "IVFFLAT_PROFILE_2B probes=%d dimensions=%d selected_lists=%d scanned_candidates=%llu scanned_pages=%llu distance_calls=%llu tuplesort_input_calls=%llu returned_rows=%llu distance_path_requested=%d direct_l2_eligible=%d direct_l2_active=%d generic_distance_calls=%llu direct_distance_calls=%llu generic_distance_ns=%llu direct_distance_ns=%llu candidate_extract_ns=%llu distance_ns=%llu tuple_materialization_ns=%llu sort_insert_ns=%llu sort_finalize_ns=%llu scan_items_total_ns=%llu page_candidates_0=%llu page_candidates_1=%llu page_candidates_2=%llu page_candidates_3=%llu page_candidates_4plus=%llu max_candidates_per_page=%llu fused2_active=%d fused_pair_calls=%llu fused_candidates=%llu single_tail_candidates=%llu fused_fallback_candidates=%llu fused_distance_ns=%llu",
-		 so->probes, so->dimensions, so->listIndex,
+	elog(INFO, "IVFFLAT_PROFILE_2B probes=%d dimensions=%d selected_lists=%d progressive_stop_stage=%d scanned_candidates=%llu scanned_pages=%llu distance_calls=%llu tuplesort_input_calls=%llu returned_rows=%llu distance_path_requested=%d direct_l2_eligible=%d direct_l2_active=%d generic_distance_calls=%llu direct_distance_calls=%llu generic_distance_ns=%llu direct_distance_ns=%llu candidate_extract_ns=%llu distance_ns=%llu tuple_materialization_ns=%llu sort_insert_ns=%llu sort_finalize_ns=%llu scan_items_total_ns=%llu page_candidates_0=%llu page_candidates_1=%llu page_candidates_2=%llu page_candidates_3=%llu page_candidates_4plus=%llu max_candidates_per_page=%llu fused2_active=%d fused_pair_calls=%llu fused_candidates=%llu single_tail_candidates=%llu fused_fallback_candidates=%llu fused_distance_ns=%llu",
+		 so->probes, so->dimensions, so->listIndex, so->progressiveStopStage,
 		 (unsigned long long) so->profile_candidates, (unsigned long long) so->profile_pages,
 		 (unsigned long long) so->profile_distance_calls, (unsigned long long) so->profile_tuplesort_input_calls,
 		 (unsigned long long) so->profile_returned_rows, ivfflat_distance_path,

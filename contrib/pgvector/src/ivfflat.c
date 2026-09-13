@@ -50,6 +50,7 @@ static const struct config_enum_entry ivfflat_iterative_scan_options[] = {
 static const struct config_enum_entry ivfflat_progressive_scan_options[] = {
 	{"off", IVFFLAT_PROGRESSIVE_SCAN_OFF, false},
 	{"shadow", IVFFLAT_PROGRESSIVE_SCAN_SHADOW, false},
+	{"on", IVFFLAT_PROGRESSIVE_SCAN_ON, false},
 	{NULL, 0, false}
 };
 
@@ -99,7 +100,7 @@ IvfflatInit(void)
 							 IVFFLAT_ITERATIVE_SCAN_OFF, ivfflat_iterative_scan_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("ivfflat.progressive_scan", "Sets the experimental progressive scan mode",
-							 "Shadow scans 16, then 32, then 64 lists and always completes all 64.",
+							 "Shadow always scans 64 lists; on applies the frozen D2-P stop policy.",
 							 &ivfflat_progressive_scan, IVFFLAT_PROGRESSIVE_SCAN_OFF,
 							 ivfflat_progressive_scan_options, PGC_USERSET, 0, NULL, NULL, NULL);
 

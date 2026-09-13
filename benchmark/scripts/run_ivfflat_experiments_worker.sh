@@ -7,14 +7,14 @@ if [[ $# -gt 0 ]]; then
 fi
 PHASE_ARGS=("$@")
 FORMAL_ARGS=()
-if [[ "${PHASE}" == "formal" ]]; then FORMAL_ARGS=("$@"); fi
+if [[ "${PHASE}" == "formal" || "${PHASE}" == "all-fomal-exp" ]]; then FORMAL_ARGS=("$@"); fi
 FORMAL_RESUME=0
 for argument in "${FORMAL_ARGS[@]}"; do
     if [[ "${argument}" == "--resume" ]]; then
         FORMAL_RESUME=1
     fi
 done
-if [[ "${PHASE}" != "formal" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && ${#PHASE_ARGS[@]} -gt 0 ]]; then
+if [[ "${PHASE}" != "formal" && "${PHASE}" != "all-fomal-exp" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && ${#PHASE_ARGS[@]} -gt 0 ]]; then
     echo "additional CLI options are supported only for formal and Phase 2B modes" >&2
     exit 2
 fi
@@ -106,9 +106,17 @@ DB_NAME=${DB_NAME:-taskdb}
 DB_USER=${DB_USER:-dev}
 PROFILE_SCRIPT="${BENCHMARK_ROOT}/scripts/ivfflat_profile.py"
 STATUS_FILE="${RUN_DIR}/status"
+D2P_SERVER_STARTED=0
 
 finish() {
     status=$?
+    if [[ "${PHASE}" == "all-fomal-exp" && "${D2P_SERVER_STARTED}" == "1" ]]; then
+        if [[ "$(id -un)" == "${PG_OS_USER}" ]]; then
+            "${PG_CTL}" -D "${PGDATA}" stop -m fast -w || true
+        elif [[ "$(id -u)" -eq 0 ]]; then
+            runuser -u "${PG_OS_USER}" -- "${PG_CTL}" -D "${PGDATA}" stop -m fast -w || true
+        fi
+    fi
     if [[ ${status} -eq 0 ]]; then
         echo "complete" >"${STATUS_FILE}"
     else
@@ -197,6 +205,15 @@ test -d "${PGDATA}"
 } >"${RUN_DIR}/environment.txt"
 
 COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
+D2P_RUN_ARGS=()
+if [[ "${PHASE}" == "all-fomal-exp" ]]; then
+    D2P_RUN_ARGS=(--phase all-fomal-exp --dataset gist-l2 --warmup 100 --queries 9000
+                  --topk 10 --lists 1000 --output "${RUN_DIR}")
+    if [[ "${FORMAL_RESUME}" == "1" ]]; then D2P_RUN_ARGS+=(--resume); fi
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${D2P_RUN_ARGS[@]}" --validate-only
+    printf '%q ' "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${D2P_RUN_ARGS[@]}" >"${RUN_DIR}/run-command.txt"
+    printf '\n' >>"${RUN_DIR}/run-command.txt"
+fi
 PHASE2B_RUN_ARGS=()
 if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-production" ]]; then
     PHASE2B_EFFECTIVE_BASELINE_PATH=${PHASE2B_BASELINE_PATH}
@@ -281,15 +298,29 @@ if [[ "${PHASE}" == "formal" ]]; then
 fi
 
 PROFILE_BUILD_ARGS=()
-if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" ]]; then
+if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "all-fomal-exp" ]]; then
     PROFILE_CFLAGS="-DIVFFLAT_BENCH -DIVFFLAT_PROFILE_2B"
     PROFILE_BUILD_ARGS=(OPTFLAGS="${PHASE2B_OPTFLAGS}")
 elif [[ "${PHASE}" == "2b-production" ]]; then
     PROFILE_CFLAGS="-DIVFFLAT_FUSED2"
     PROFILE_BUILD_ARGS=(OPTFLAGS="${PHASE2B_OPTFLAGS}")
 fi
-if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
+if [[ ( "${PHASE}" == "formal" || "${PHASE}" == "all-fomal-exp" ) && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; keep installed build and index"
+    if [[ "${PHASE}" == "all-fomal-exp" ]]; then
+        echo "[$(date -u --iso-8601=seconds)] start PostgreSQL for D2-P resume"
+        if "${PG_CTL}" -D "${PGDATA}" status >/dev/null 2>&1; then
+            echo "PostgreSQL is already running"
+        elif [[ "$(id -un)" == "${PG_OS_USER}" ]]; then
+            "${PG_CTL}" -D "${PGDATA}" start -w
+        elif [[ "$(id -u)" -eq 0 ]]; then
+            runuser -u "${PG_OS_USER}" -- "${PG_CTL}" -D "${PGDATA}" start -w
+        else
+            echo "cannot start PostgreSQL: current user=$(id -un), required user=${PG_OS_USER}" >&2
+            exit 1
+        fi
+        D2P_SERVER_STARTED=1
+    fi
 else
     if [[ "${PHASE}" == "formal" ]]; then
         echo "[$(date -u --iso-8601=seconds)] build production pgvector without IVFFLAT_BENCH"
@@ -321,9 +352,9 @@ else
             if strings "${INSTALLED_VECTOR_SO}" | grep -q "IVFFLAT_PROFILE"; then
                 echo "production vector.so contains profiling NOTICE strings" >&2
                 exit 1
-            fi
-        fi
-    fi
+			fi
+		fi
+	fi
     echo "[$(date -u --iso-8601=seconds)] restart PostgreSQL as ${PG_OS_USER}"
     if [[ "$(id -un)" == "${PG_OS_USER}" ]]; then
         "${PG_CTL}" -D "${PGDATA}" restart -m fast -w
@@ -333,6 +364,14 @@ else
         echo "cannot restart PostgreSQL: current user=$(id -un), required user=${PG_OS_USER}" >&2
         exit 1
     fi
+    if [[ "${PHASE}" == "all-fomal-exp" ]]; then D2P_SERVER_STARTED=1; fi
+fi
+
+if [[ "${PHASE}" == "all-fomal-exp" ]]; then
+    INSTALLED_VECTOR_SO=${PGVECTOR_INSTALLED_SO:-"$("${PG_CONFIG}" --pkglibdir)/vector.so"}
+    sha256sum "${INSTALLED_VECTOR_SO}" >"${RUN_DIR}/vector.so.sha256"
+    echo "d2p_profile_cflags=-DIVFFLAT_BENCH -DIVFFLAT_PROFILE_2B" >>"${RUN_DIR}/environment.txt"
+    echo "d2p_optflags=${PHASE2B_OPTFLAGS}" >>"${RUN_DIR}/environment.txt"
 fi
 
 BUILD_DATASET=all
@@ -345,7 +384,7 @@ elif [[ "${PHASE}" == "formal" ]]; then
 fi
 if [[ "${PHASE}" == "formal" && "${FORMAL_RESUME}" == "1" ]]; then
     echo "[$(date -u --iso-8601=seconds)] resume formal run; skip index rebuild"
-elif [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-production" ]]; then
+elif [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-production" || "${PHASE}" == "all-fomal-exp" ]]; then
     echo "[$(date -u --iso-8601=seconds)] phase ${PHASE} reuses existing IVFFlat indexes"
 else
     echo "[$(date -u --iso-8601=seconds)] build indexes dataset=${BUILD_DATASET}"
@@ -387,6 +426,9 @@ if [[ "${PHASE}" == "formal" ]]; then
         --warmup-queries "${FORMAL_WARMUP}" --queries "${FORMAL_QUERIES}" \
         --topk "${TOPK}" --probes-list "${FORMAL_PROBES}" --lists "${LISTS}" \
         --output "${RUN_DIR}/phase_formal" "${FORMAL_ARGS[@]}"
+fi
+if [[ "${PHASE}" == "all-fomal-exp" ]]; then
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${D2P_RUN_ARGS[@]}"
 fi
 if [[ "${PHASE}" == "all" || "${PHASE}" == "a" ]]; then run_phase a; fi
 if [[ "${PHASE}" == "all" || "${PHASE}" == "b" ]]; then run_phase b; fi

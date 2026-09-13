@@ -140,7 +140,8 @@ typedef enum IvfflatIterativeScanMode
 typedef enum IvfflatProgressiveScanMode
 {
 	IVFFLAT_PROGRESSIVE_SCAN_OFF,
-	IVFFLAT_PROGRESSIVE_SCAN_SHADOW
+	IVFFLAT_PROGRESSIVE_SCAN_SHADOW,
+	IVFFLAT_PROGRESSIVE_SCAN_ON
 }			IvfflatProgressiveScanMode;
 
 #ifdef IVFFLAT_DISTANCE_PATH
@@ -412,6 +413,8 @@ typedef struct IvfflatScanOpaqueData
 
 	/* Progressive shadow scan */
 	bool		progressiveShadow;
+	bool		progressiveEarlyStop;
+	int			progressiveStopStage;
 	int			shadowK;
 	int			shadowCapacity;
 	int			shadowTopCount;
