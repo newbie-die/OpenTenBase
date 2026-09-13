@@ -22,6 +22,11 @@
 #endif
 
 int			ivfflat_probes;
+bool		ivfflat_adaptive_probes;
+bool		ivfflat_adaptive_probes_trace;
+double		ivfflat_adaptive_probes_ratio_16;
+double		ivfflat_adaptive_probes_ratio_32;
+double		ivfflat_adaptive_probes_ratio_64;
 int			ivfflat_iterative_scan;
 int			ivfflat_max_probes;
 int			ivfflat_experimental_sort_bound;
@@ -62,6 +67,24 @@ IvfflatInit(void)
 	DefineCustomIntVariable("ivfflat.probes", "Sets the number of probes",
 							"Valid range is 1..lists.", &ivfflat_probes,
 							IVFFLAT_DEFAULT_PROBES, IVFFLAT_MIN_LISTS, IVFFLAT_MAX_LISTS, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("ivfflat.adaptive_probes", "Selects probes from the centroid-distance ratio",
+							 "Uses ivfflat.probes as the maximum and fallback. Experimental.",
+							 &ivfflat_adaptive_probes, false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("ivfflat.adaptive_probes_trace", "Emits centroid-distance features for adaptive-probe calibration",
+							 "Experimental calibration trace; disable for latency measurements.",
+							 &ivfflat_adaptive_probes_trace, false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("ivfflat.adaptive_probes_ratio_16", "Minimum d2/d1 ratio for 16 probes",
+							 "Set from calibration. The conservative default never selects 16 probes.",
+							 &ivfflat_adaptive_probes_ratio_16, DBL_MAX, 1.0, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("ivfflat.adaptive_probes_ratio_32", "Minimum d2/d1 ratio for 32 probes",
+							 "Set from calibration. The conservative default never selects 32 probes.",
+							 &ivfflat_adaptive_probes_ratio_32, DBL_MAX, 1.0, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("ivfflat.adaptive_probes_ratio_64", "Minimum d2/d1 ratio for 64 probes",
+							 "Set from calibration. The conservative default never selects 64 probes.",
+							 &ivfflat_adaptive_probes_ratio_64, DBL_MAX, 1.0, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("ivfflat.iterative_scan", "Sets the mode for iterative scans",
 							 NULL, &ivfflat_iterative_scan,

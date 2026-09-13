@@ -79,6 +79,41 @@ CompareLists(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 }
 
 /*
+ * A larger d2/d1 means the nearest centroid is more clearly separated from
+ * its runner-up and can use fewer probes. ivfflat.probes remains the maximum
+ * number retained and the fallback for an unset or inapplicable rule.
+ */
+static int
+AdaptiveProbeCount(IvfflatScanOpaque so, int listCount)
+{
+	double		d1;
+	double		d2;
+	double		ratio;
+	int			probes;
+
+	if (!ivfflat_adaptive_probes || listCount < 16 || so->maxProbes < 16)
+		return so->probes;
+
+	d1 = so->listDistances[0];
+	d2 = so->listDistances[1];
+	if (d1 > 0)
+		ratio = d2 / d1;
+	else
+		ratio = d2 > 0 ? DBL_MAX : 1.0;
+
+	if (ratio >= ivfflat_adaptive_probes_ratio_16)
+		probes = 16;
+	else if (ratio >= ivfflat_adaptive_probes_ratio_32)
+		probes = 32;
+	else if (ratio >= ivfflat_adaptive_probes_ratio_64)
+		probes = 64;
+	else
+		probes = 128;
+
+	return Min(probes, so->maxProbes);
+}
+
+/*
  * Get lists and sort by distance
  */
 static void
@@ -149,9 +184,36 @@ GetScanLists(IndexScanDesc scan, Datum value)
 	}
 
 	for (int i = listCount - 1; i >= 0; i--)
-		so->listPages[i] = GetScanList(pairingheap_remove_first(so->listQueue))->startPage;
+	{
+		IvfflatScanList *scanlist = GetScanList(pairingheap_remove_first(so->listQueue));
+
+		so->listPages[i] = scanlist->startPage;
+		so->listDistances[i] = scanlist->distance;
+	}
 
 	Assert(pairingheap_is_empty(so->listQueue));
+	so->probes = AdaptiveProbeCount(so, listCount);
+
+	if (ivfflat_adaptive_probes_trace && listCount >= 64)
+	{
+		double		d1 = so->listDistances[0];
+		double		ratio = d1 > 0 ? so->listDistances[1] / d1 :
+			(so->listDistances[1] > 0 ? DBL_MAX : 1.0);
+
+		elog(INFO, "IVFFLAT_ADAPTIVE d1=%.17g d2=%.17g d4=%.17g d8=%.17g d16=%.17g d32=%.17g d64=%.17g d2_d1=%.17g d4_d1=%.17g d8_d1=%.17g d16_d1=%.17g d32_d1=%.17g d64_d1=%.17g d32_d16=%.17g d64_d32=%.17g gap=%.17g gap32_16_d1=%.17g gap64_32_d1=%.17g probes=%d max_probes=%d",
+			 d1, so->listDistances[1], so->listDistances[3],
+			 so->listDistances[7], so->listDistances[15],
+			 so->listDistances[31], so->listDistances[63], ratio,
+			 so->listDistances[3] / d1, so->listDistances[7] / d1,
+			 so->listDistances[15] / d1, so->listDistances[31] / d1,
+			 so->listDistances[63] / d1,
+			 so->listDistances[31] / so->listDistances[15],
+			 so->listDistances[63] / so->listDistances[31],
+			 so->listDistances[1] - d1,
+			 (so->listDistances[31] - so->listDistances[15]) / d1,
+			 (so->listDistances[63] - so->listDistances[31]) / d1,
+			 so->probes, so->maxProbes);
+	}
 }
 
 /*
@@ -661,6 +723,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 
 	so->listQueue = pairingheap_allocate(CompareLists, scan);
 	so->listPages = palloc_array_checked(BlockNumber, maxProbes);
+	so->listDistances = palloc_array_checked(double, maxProbes);
 	so->listIndex = 0;
 	so->lists = palloc_array_checked(IvfflatScanList, maxProbes);
 

@@ -113,6 +113,11 @@ typedef Pointer Item;
 
 /* Variables */
 extern int	ivfflat_probes;
+extern bool ivfflat_adaptive_probes;
+extern bool ivfflat_adaptive_probes_trace;
+extern double ivfflat_adaptive_probes_ratio_16;
+extern double ivfflat_adaptive_probes_ratio_32;
+extern double ivfflat_adaptive_probes_ratio_64;
 extern int	ivfflat_iterative_scan;
 extern int	ivfflat_max_probes;
 extern int	ivfflat_experimental_sort_bound;
@@ -374,6 +379,7 @@ typedef struct IvfflatScanOpaqueData
 	/* Lists */
 	pairingheap *listQueue;
 	BlockNumber *listPages;
+	double		 *listDistances;
 	int			listIndex;
 	IvfflatScanList *lists;
 }			IvfflatScanOpaqueData;
