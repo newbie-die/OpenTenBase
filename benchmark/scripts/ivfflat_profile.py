@@ -1482,7 +1482,7 @@ def validate_phase2b_options(args):
         raise ValueError("--check-fused2-edges requires a fused2 comparison")
 
 
-# Phase C extends the shared runner; Part 2 is deliberately not enabled here.
+# Phase C extends the shared runner with validated smoke and formal execution modes.
 PHASE_C_SYSTEMS = ('pristine', 'vanilla_eq', 'phase2a', 'phase2b', 'final')
 PHASE_C_FLAGS = '-march=haswell -mtune=haswell -mavx2 -mfma'
 
@@ -1727,6 +1727,12 @@ def phase_c_validate_checkpoint(rows, expected, manifest, neighbors):
 
 
 def validate_phase_c_options(args):
+    if args.part2:
+        if args.part1 or (args.dataset, args.queries, args.warmup, args.rounds, tuple(args.probes_list), args.lists, args.topk) != ('gist-l2', 1000, 100, 10, PROBES, 1000, 10):
+            raise ValueError('Part 2 requires five systems, GIST1M, 1000 queries, 100 warmups, ten rounds and all nine probes')
+        if args.stop_after or not 0 <= args.stop_after_configs < 450:
+            raise ValueError('Part 2 interruption uses --stop-after-configs in 0..449')
+        return
     if not args.part1 or (args.dataset, args.queries, args.warmup, args.rounds, tuple(args.probes_list), args.lists, args.topk) != ('gist-l2', 3, 1, 1, (16,), 1000, 10):
         raise ValueError('Phase C Part 1 only: --part1 --dataset gist-l2 --queries 3 --warmup 1 --rounds 1 --probes-list 16 --lists 1000 --topk 10')
     if args.stop_after < 0 or args.stop_after >= 15:
@@ -1743,7 +1749,10 @@ def run_formal(conn, args):
         # The PostgreSQL installation is shared across output directories.
         with (ROOT / '.phase_c_database.lock').open('w') as db_lock:
             fcntl.flock(db_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            phase_c_part1(args, root)
+            if args.part2:
+                phase_c_part2(args, root)
+            else:
+                phase_c_part1(args, root)
 
 
 def phase_c_part1(args, root):
@@ -1870,6 +1879,306 @@ def phase_c_part1(args, root):
     print('PASS: Phase C infrastructure validated; Part 2 was not run.', flush=True)
 
 
+# Phase C formal execution uses the exact artifacts/configuration validated in Part 1.
+PHASE_C_RAW_FIELDS = ('phase', 'experiment', 'system', 'binary_family', 'dataset',
+    'dimension', 'metric', 'source_commit', 'binary_sha256', 'lists', 'probes',
+    'topk', 'round', 'config_position', 'query_order_position', 'query_id',
+    'latency_us', 'returned_rows', 'result_ids', 'result_checksum', 'recall_at_10')
+PHASE_C_ROUND_FIELDS = ('system', 'binary_family', 'probes', 'round', 'config_position',
+    'queries', 'warmup_queries', 'p50_us', 'p95_us', 'p99_us', 'mean_us', 'wall_seconds',
+    'qps', 'mean_recall_at_10', 'minimum_returned_rows')
+
+
+def phase_c_json_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def phase_c_schedule():
+    permutations, schedule = [], []
+    optimized = list(PHASE_C_SYSTEMS[1:])
+    for round_no in range(1, 11):
+        seed = 20260908 + round_no
+        queries = list(range(1000))
+        random.Random(seed).shuffle(queries)
+        probes = list(PROBES)
+        random.Random(seed + 100000).shuffle(probes)
+        rotation = (round_no - 1) % 4
+        systems = optimized[rotation:] + optimized[:rotation]
+        families = ['pristine', 'optimized'] if round_no % 2 else ['optimized', 'pristine']
+        permutations.append(dict(round=round_no, seed=seed, permutation=queries,
+            permutation_sha256=phase_c_json_hash(queries), probes_order=probes,
+            family_order=families, optimized_system_order=systems))
+        for family in families:
+            for system in (['pristine'] if family == 'pristine' else systems):
+                for probe in probes:
+                    schedule.append(dict(system=system, binary_family=family, probes=probe,
+                                         round=round_no, config_position=len(schedule) + 1))
+    return permutations, schedule
+
+
+def phase_c_formal_manifest(args, root):
+    manifest_path = root / 'phase_c_manifest.json'
+    previous = json.loads(manifest_path.read_text()) if args.resume else None
+    if manifest_path.exists() and not args.resume:
+        raise RuntimeError('Formal output exists; use --resume')
+    source = args.part1_artifacts or (previous['part1_artifacts'] if previous else None)
+    if not source:
+        raise RuntimeError('--part1-artifacts must identify the validated Part 1 artifact directory')
+    source = Path(source).resolve()
+    part1 = json.loads((source / 'phase_c_manifest.json').read_text())
+    report = json.loads((source / 'phase_c_part1_report.json').read_text())
+    audit = json.loads((source / 'ground_truth_verification.json').read_text())
+    if (part1['phase'], part1['part'], report['decision'], audit['status']) != ('C', 1, 'PASS', 'PASS') or audit['exact_matches'] != 20:
+        raise RuntimeError('Part 1 PASS and successful ground-truth audit required')
+    metadata = json.loads((source / 'phase_c_build_manifest.json').read_text())
+    if any(part1.get(k) != v for k, v in metadata.items()):
+        raise RuntimeError('Part 1 build provenance mismatch')
+    supplied = os.environ.get('PRISTINE_COMMIT')
+    if supplied and phase_c_command(['git', '-C', SCRIPT_ROOT.parent, 'rev-parse', supplied + '^{commit}']) != part1['pristine_commit']:
+        raise RuntimeError('PRISTINE_COMMIT differs from validated binary')
+    for binary in ('pristine', 'optimized'):
+        if phase_c_hash(source / 'binaries' / binary / 'vector.so') != part1[binary + '_binary_sha256']:
+            raise RuntimeError('Part 1 binary changed')
+    # A framework-only commit after Part 1 must not relabel the binary source commit.
+    if phase_c_command(['git', '-C', SCRIPT_ROOT.parent, 'diff', part1['optimized_commit'], '--', 'contrib/pgvector', 'src']):
+        raise RuntimeError('Algorithm/server source differs from Part 1')
+    pg_config = os.environ.get('PG_CONFIG', '/workspace/install/bin/pg_config')
+    if phase_c_hash(Path(pg_config).with_name('postgres')) != part1['postgres_sha256']:
+        raise RuntimeError('PostgreSQL executable changed since Part 1')
+    if phase_c_hash(CONFIGS['gist-l2']['dataset']) != part1['dataset_sha256']:
+        raise RuntimeError('Dataset changed since Part 1 audit')
+    permutations, schedule = phase_c_schedule()
+    manifest = {**metadata, 'phase': 'C', 'experiment': 'phase_c', 'part': 2,
+        'smoke_only': False, 'dataset': 'GIST1M', 'dimension': 960, 'metric': 'L2',
+        'lists': 1000, 'topk': 10, 'probes': list(PROBES), 'rounds': 10,
+        'systems': list(PHASE_C_SYSTEMS), 'unique_queries': 1000, 'warmup_queries': 100,
+        'expected_rows': 450000, 'index': part1['index'], 'part1_artifacts': str(source),
+        'dataset_sha256': part1['dataset_sha256'], 'part1_report_sha256': phase_c_hash(source / 'phase_c_part1_report.json'),
+        'ground_truth_sha256': phase_c_hash(source / 'ground_truth_verification.json'),
+        'runner_sha256': phase_c_hash(__file__), 'query_permutations': permutations,
+        'run_order': schedule, 'seed_base': 20260908,
+        'sql': f"SELECT id FROM {CONFIGS['gist-l2']['table']} ORDER BY embedding <-> %s::vector LIMIT 10",
+        'timing_boundary': 'execute + fetchall; literal, Recall, checksum and serialization excluded',
+        'qps_definition': '1000 / measured sequential loop wall seconds; excludes warmup and checkpoint writes, includes per-query Python bookkeeping',
+        'recall_sampling': '1000 unique queries repeated over 10 execution rounds',
+        'database': {key: getattr(args, key) for key in ('host', 'port', 'dbname', 'user')}}
+    if previous is not None and previous != manifest:
+        differing = [k for k in set(previous) | set(manifest) if previous.get(k) != manifest.get(k)]
+        raise RuntimeError('Reject resume: manifest mismatch in ' + ', '.join(differing))
+    if previous is None:
+        for binary in ('pristine', 'optimized'):
+            target = root / 'binaries' / binary
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / 'binaries' / binary / 'vector.so', target / 'vector.so')
+            shutil.copy2(source / f'{binary}_compile_command.txt', root / f'{binary}_compile_command.txt')
+            (root / f'{binary}_commit.txt').write_text(part1[binary + '_commit'] + '\n')
+            (root / f'{binary}_vector.so.sha256').write_text(part1[binary + '_binary_sha256'] + '  vector.so\n')
+        shutil.copy2(source / 'ground_truth_verification.json', root / 'ground_truth_verification.json')
+        write_json_atomic(root / 'query_permutations.json', permutations)
+        (root / 'run_order.txt').write_text('\n'.join(json.dumps(item, sort_keys=True) for item in schedule) + '\n')
+        (root / 'index_identity.txt').write_text(json.dumps(part1['index'], indent=2) + '\n')
+        environment = root.parent / 'environment.txt'
+        if environment.exists():
+            shutil.copy2(environment, root / 'environment.txt')
+        write_json_atomic(manifest_path, manifest)
+    else:
+        if json.loads((root / 'query_permutations.json').read_text()) != permutations:
+            raise RuntimeError('Resume permutation evidence changed')
+        for binary in ('pristine', 'optimized'):
+            if phase_c_hash(root / 'binaries' / binary / 'vector.so') != manifest[binary + '_binary_sha256']:
+                raise RuntimeError('Formal archived binary mismatch')
+    return manifest
+
+
+def phase_c_block_path(root, config):
+    return root / 'checkpoints' / f"{config['config_position']:03d}_{config['system']}_p{config['probes']}_r{config['round']:02d}.json"
+
+
+def phase_c_validate_block(block, config, manifest, gt):
+    if block.get('complete') is not True or block.get('config') != config or block.get('manifest_sha256') != phase_c_json_hash(manifest):
+        raise RuntimeError('Incomplete or mismatched formal checkpoint')
+    rows = block['rows']
+    permutation = manifest['query_permutations'][config['round'] - 1]['permutation']
+    if len(rows) != 1000 or [r['query_id'] for r in rows] != permutation:
+        raise RuntimeError('Missing, duplicate or out-of-order checkpoint query keys')
+    family = config['binary_family']
+    fixed = {'phase': 'C', 'experiment': 'phase_c', 'dataset': 'GIST1M', 'dimension': 960,
+             'metric': 'L2', 'source_commit': manifest[family + '_commit'],
+             'binary_sha256': manifest[family + '_binary_sha256'], 'lists': 1000, 'topk': 10, **config}
+    for position, row in enumerate(rows):
+        if set(row) != set(PHASE_C_RAW_FIELDS) or any(row[k] != v for k, v in fixed.items()) or row['query_order_position'] != position:
+            raise RuntimeError('Formal row schema/config mismatch')
+        ids = [int(i) for i in row['result_ids'].split(';')] if row['result_ids'] else []
+        if (len(ids) > 10 or len(set(ids)) != len(ids) or row['returned_rows'] != len(ids)
+                or any(i < 0 or i >= 1000000 for i in ids)
+                or hashlib.sha256(row['result_ids'].encode()).hexdigest() != row['result_checksum']
+                or not math.isfinite(row['latency_us']) or row['latency_us'] <= 0
+                or row['recall_at_10'] != len(set(ids) & gt[row['query_id']]) / 10):
+            raise RuntimeError('Invalid formal result, checksum, latency or Recall')
+    summary = block['summary']
+    if (set(summary) != set(PHASE_C_ROUND_FIELDS) or any(summary[k] != v for k, v in config.items())
+            or summary['queries'] != 1000 or summary['warmup_queries'] != 100
+            or summary['wall_seconds'] <= 0 or summary['qps'] != 1000 / summary['wall_seconds']):
+        raise RuntimeError('Invalid formal summary metadata')
+    if block['rows_sha256'] != phase_c_json_hash(rows):
+        raise RuntimeError('Formal checkpoint content hash mismatch')
+    return rows
+
+
+def phase_c_append_csv(path, rows, fields):
+    exists = path.exists()
+    with path.open('a', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        writer.writerows(rows)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def phase_c_rebuild_csv(root, blocks):
+    # Canonical atomic checkpoints recover derived CSVs if interruption occurred during append.
+    def raw_rows():
+        for path in blocks:
+            yield from json.loads(path.read_text())['rows']
+    def summaries():
+        for path in blocks:
+            yield json.loads(path.read_text())['summary']
+    write_csv_atomic(root / 'phase_c_raw.csv', raw_rows(), PHASE_C_RAW_FIELDS)
+    write_csv_atomic(root / 'phase_c_rounds.csv', summaries(), PHASE_C_ROUND_FIELDS)
+
+
+def phase_c_part2(args, root):
+    manifest = phase_c_formal_manifest(args, root)
+    queries, neighbors = load_workload(CONFIGS['gist-l2'], 1000, 10, True)
+    literals = [vector_literal(q) for q in queries]
+    gt = [set(map(int, row)) for row in neighbors]
+    schedule = manifest['run_order']
+    expected_paths = {phase_c_block_path(root, c) for c in schedule}
+    (root / 'checkpoints').mkdir(exist_ok=True)
+    if set((root / 'checkpoints').glob('*.json')) - expected_paths:
+        raise RuntimeError('Unexpected checkpoint files')
+    completed, paths = set(), []
+    for config in schedule:
+        path = phase_c_block_path(root, config)
+        if path.exists():
+            phase_c_validate_block(json.loads(path.read_text()), config, manifest, gt)
+            completed.add(config['config_position'])
+            paths.append(path)
+    phase_c_rebuild_csv(root, paths)
+    if args.resume:
+        with (root / 'phase_c_resume.jsonl').open('a') as log:
+            log.write(json.dumps({'time': time.time(), 'validated_blocks': len(completed), 'validated_rows': len(completed) * 1000, 'manifest_sha256': phase_c_json_hash(manifest)}) + '\n')
+    initial_completed = len(completed)
+    conn, active_family = None, None
+    try:
+        for config in schedule:
+            if config['config_position'] in completed:
+                continue
+            family = config['binary_family']
+            if family != active_family:
+                if conn is not None:
+                    conn.close()
+                conn = phase_c_activate(args, root, manifest, family)
+                active_family = family
+                with conn.cursor() as cur:
+                    if phase_c_index(cur) != manifest['index']:
+                        raise RuntimeError('STOP: index identity changed after binary switch')
+            with conn.cursor() as cur:
+                if phase_c_hash(manifest['installed_so']) != manifest[family + '_binary_sha256']:
+                    raise RuntimeError('STOP: active binary hash changed before configuration')
+                if phase_c_index(cur) != manifest['index']:
+                    raise RuntimeError('STOP: index identity changed before configuration')
+                gucs = phase_c_settings(cur, config['system'], config['probes'])
+                permutation = manifest['query_permutations'][config['round'] - 1]['permutation']
+                cur.execute('EXPLAIN (FORMAT JSON) ' + manifest['sql'], (literals[permutation[0]],))
+                plan = cur.fetchone()[0]
+                if CONFIGS['gist-l2']['index'] not in json.dumps(plan) or 'Index Scan' not in json.dumps(plan):
+                    raise RuntimeError('Formal query did not select shared ANN index')
+                print(f"Phase C config {config['config_position']}/450 {config} warmup=100", flush=True)
+                for qid in permutation[:100]:
+                    cur.execute(manifest['sql'], (literals[qid],))
+                    cur.fetchall()
+                conn.notices.clear()
+                fixed = {'phase': 'C', 'experiment': 'phase_c', 'dataset': 'GIST1M',
+                    'dimension': 960, 'metric': 'L2', 'source_commit': manifest[family + '_commit'],
+                    'binary_sha256': manifest[family + '_binary_sha256'], 'lists': 1000, 'topk': 10, **config}
+                rows = []
+                loop_started = time.perf_counter_ns()
+                for position, qid in enumerate(permutation):
+                    literal = literals[qid]
+                    started = time.perf_counter_ns()
+                    cur.execute(manifest['sql'], (literal,))
+                    fetched = cur.fetchall()
+                    latency_us = (time.perf_counter_ns() - started) / 1000
+                    ids = [int(row[0]) for row in fetched]
+                    result_ids = ';'.join(map(str, ids))
+                    rows.append({**fixed, 'query_order_position': position, 'query_id': qid,
+                        'latency_us': latency_us, 'returned_rows': len(ids), 'result_ids': result_ids,
+                        'result_checksum': hashlib.sha256(result_ids.encode()).hexdigest(),
+                        'recall_at_10': len(set(ids) & gt[qid]) / 10})
+                wall_seconds = (time.perf_counter_ns() - loop_started) / 1e9
+                if any('IVFFLAT_PROFILE' in n for n in conn.notices):
+                    raise RuntimeError('Profiling NOTICE during formal execution')
+                latencies = [r['latency_us'] for r in rows]
+                summary = {**config, 'queries': 1000, 'warmup_queries': 100,
+                    'p50_us': percentile(latencies, 50), 'p95_us': percentile(latencies, 95),
+                    'p99_us': percentile(latencies, 99), 'mean_us': statistics.fmean(latencies),
+                    'wall_seconds': wall_seconds, 'qps': 1000 / wall_seconds,
+                    'mean_recall_at_10': statistics.fmean(r['recall_at_10'] for r in rows),
+                    'minimum_returned_rows': min(r['returned_rows'] for r in rows)}
+                block = {'complete': True, 'config': config, 'manifest_sha256': phase_c_json_hash(manifest),
+                    'rows': rows, 'rows_sha256': phase_c_json_hash(rows), 'summary': summary,
+                    'gucs': gucs, 'plan': plan, 'index': manifest['index'], 'completed_at': time.time()}
+                phase_c_validate_block(block, config, manifest, gt)
+                write_json_atomic(phase_c_block_path(root, config), block)
+                phase_c_append_csv(root / 'phase_c_raw.csv', rows, PHASE_C_RAW_FIELDS)
+                phase_c_append_csv(root / 'phase_c_rounds.csv', [summary], PHASE_C_ROUND_FIELDS)
+                completed.add(config['config_position'])
+                write_json_atomic(root / 'phase_c_progress.json', {'status': 'RUNNING', 'completed_configs': len(completed), 'expected_configs': 450, 'measured_rows': len(completed) * 1000, 'last_config': config, 'updated_at': time.time()})
+                print(f"Phase C checkpoint {len(completed)}/450 rows={len(completed)*1000} wall={wall_seconds:.3f}s", flush=True)
+                if args.stop_after_configs and len(completed) - initial_completed >= args.stop_after_configs:
+                    write_json_atomic(root / 'phase_c_interruption.json', {'status': 'INTERRUPTED', 'completed_configs': len(completed), 'measured_rows': len(completed) * 1000})
+                    raise SystemExit(75)
+    except Exception as exc:
+        write_json_atomic(root / 'phase_c_failure.json', {'status': 'FAILED', 'error': str(exc), 'completed_configs': len(completed), 'time': time.time()})
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+    # Validate every canonical row before publishing COMPLETE. No performance conclusions here.
+    seen = set()
+    minimum = 10
+    paths = []
+    for config in schedule:
+        path = phase_c_block_path(root, config)
+        block = json.loads(path.read_text())
+        for row in phase_c_validate_block(block, config, manifest, gt):
+            key = phase_c_key(row)
+            if key in seen:
+                raise RuntimeError('Duplicate formal execution key')
+            seen.add(key)
+            minimum = min(minimum, row['returned_rows'])
+        paths.append(path)
+    expected = {(s, p, r, q) for s in PHASE_C_SYSTEMS for p in PROBES for r in range(1, 11) for q in range(1000)}
+    missing = len(expected - seen)
+    if missing or len(seen) != 450000:
+        raise RuntimeError('Formal execution incomplete')
+    phase_c_rebuild_csv(root, paths)
+    report = {'decision': 'COMPLETE', 'systems': 5, 'probes': 9, 'rounds': 10,
+        'unique_queries': 1000, 'measured_per_system_probes': 10000,
+        'expected_rows': 450000, 'actual_rows': len(seen), 'duplicate_keys': 0, 'missing_keys': missing,
+        'minimum_returned_rows': minimum, 'invalid_result_checksums': 0, 'query_execution_errors': 0,
+        'checkpoint_blocks': 450, 'resume_validation': 'PASS' if args.resume else 'available; not exercised',
+        'pristine_binary_sha256': manifest['pristine_binary_sha256'],
+        'optimized_binary_sha256': manifest['optimized_binary_sha256'],
+        'family_balance': {'pristine_first_rounds': 5, 'optimized_first_rounds': 5},
+        'part3_executed': False, 'completed_at': time.time()}
+    write_json_atomic(root / 'phase_c_part2_report.json', report)
+    write_json_atomic(root / 'phase_c_progress.json', {'status': 'COMPLETE', 'completed_configs': 450, 'measured_rows': 450000})
+    print('COMPLETE: 450000 measured rows; no duplicates or missing keys. Part 3 was not run.', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -1904,6 +2213,9 @@ def main():
     run.add_argument("--unsupported-queries", type=int, default=10)
     run.add_argument("--output", type=Path)
     run.add_argument("--resume", action="store_true")
+    run.add_argument("--part2", action="store_true", help="Execute the fixed 450000-query Phase C workload")
+    run.add_argument("--part1-artifacts", type=Path)
+    run.add_argument("--stop-after-configs", type=int, default=0, help="Interrupt after N complete formal configs, exit 75")
     run.add_argument("--part1", action="store_true", help="Run only Phase C infrastructure smoke")
     run.add_argument("--stop-after", type=int, default=0, help="Interrupt after N durable smoke rows, exit 75")
     run.add_argument("--verify-ground-truth", action="store_true")

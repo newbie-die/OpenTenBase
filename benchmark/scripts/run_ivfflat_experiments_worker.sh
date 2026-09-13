@@ -249,13 +249,34 @@ if [[ "${PHASE}" == "2b" || "${PHASE}" == "2b-correctness" || "${PHASE}" == "2b-
     printf '\n' >>"${RUN_DIR}/run-command.txt"
 fi
 
-# Phase C owns builds, safe activation, the shared index, and durable resume.
-# Defaults are strictly Part 1; the Python guard refuses a formal-sized workload.
+# Both Phase C parts use the shared runner. Part 2 never rebuilds binaries/index.
 if [[ "${PHASE}" == "formal" ]]; then
-    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run \
-        --phase formal --part1 --dataset gist-l2 --queries 3 --warmup 1 \
-        --rounds 1 --probes-list 16 --lists 1000 --topk 10 \
-        --output "${RUN_DIR}/phase_c_artifacts" "${FORMAL_ARGS[@]}"
+    FORMAL_PART2=0
+    for argument in "${FORMAL_ARGS[@]}"; do
+        if [[ "${argument}" == "--part2" ]]; then FORMAL_PART2=1; fi
+    done
+    if [[ "${FORMAL_RESUME}" == "1" && -f "${RUN_DIR}/phase_c_artifacts/phase_c_manifest.json" ]]; then
+        if "${PYTHON_BIN}" -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("part") != 2)' "${RUN_DIR}/phase_c_artifacts/phase_c_manifest.json"; then
+            FORMAL_PART2=1
+        fi
+    fi
+    if [[ "${FORMAL_PART2}" == "1" ]]; then
+        PHASE_C_DEFAULTS=(--part2 --dataset gist-l2 --queries 1000 --warmup 100
+                          --rounds 10 --probes-list 1,2,4,8,16,32,64,128,256)
+    else
+        PHASE_C_DEFAULTS=(--part1 --dataset gist-l2 --queries 3 --warmup 1
+                          --rounds 1 --probes-list 16)
+    fi
+    PHASE_C_RUN_ARGS=("${COMMON_ARGS[@]}" run --phase formal "${PHASE_C_DEFAULTS[@]}"
+                      --lists 1000 --topk 10 --output "${RUN_DIR}/phase_c_artifacts" "${FORMAL_ARGS[@]}")
+    printf '%q ' "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${PHASE_C_RUN_ARGS[@]}" >"${RUN_DIR}/phase_c_run_command.txt"
+    printf '\n' >>"${RUN_DIR}/phase_c_run_command.txt"
+    if [[ "${FORMAL_PART2}" == "1" ]]; then
+        sed -i 's/^formal_warmup=.*/formal_warmup=100/; s/^formal_queries=.*/formal_queries=1000/; s/^formal_probes=.*/formal_probes=1,2,4,8,16,32,64,128,256/' "${RUN_DIR}/environment.txt"
+        echo 'phase_c_part=2' >>"${RUN_DIR}/environment.txt"
+        echo 'formal_rounds=10' >>"${RUN_DIR}/environment.txt"
+    fi
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${PHASE_C_RUN_ARGS[@]}"
     exit 0
 fi
 
