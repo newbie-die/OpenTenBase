@@ -52,6 +52,15 @@ def validate_holdout(output=None):
     if output:
         output.mkdir(parents=True, exist_ok=True)
         atomic_json(output / "holdout_preflight.json", result)
+        atomic_json(output / "progress.json", {
+            "status": "PREFLIGHT_PASS" if result["status"] == "PASS" else "BLOCKED",
+            "current_config": "preflight",
+            "completed_queries": 0,
+            "total_queries": len(CONFIGS) * 9000,
+            "elapsed_seconds": 0.0,
+            "ETA_seconds": None,
+            "reason": result.get("reason"),
+        })
     if result["status"] != "PASS":
         raise RuntimeError(result["reason"] + f"; checked {path}")
     return result
