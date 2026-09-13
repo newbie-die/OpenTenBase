@@ -119,6 +119,8 @@ extern double ivfflat_adaptive_probes_ratio_16;
 extern double ivfflat_adaptive_probes_ratio_32;
 extern double ivfflat_adaptive_probes_ratio_64;
 extern int	ivfflat_iterative_scan;
+extern int	ivfflat_progressive_scan;
+extern bool ivfflat_progressive_scan_debug;
 extern int	ivfflat_max_probes;
 extern int	ivfflat_experimental_sort_bound;
 extern bool ivfflat_bounded_scan;
@@ -134,6 +136,12 @@ typedef enum IvfflatIterativeScanMode
 	IVFFLAT_ITERATIVE_SCAN_OFF,
 	IVFFLAT_ITERATIVE_SCAN_RELAXED
 }			IvfflatIterativeScanMode;
+
+typedef enum IvfflatProgressiveScanMode
+{
+	IVFFLAT_PROGRESSIVE_SCAN_OFF,
+	IVFFLAT_PROGRESSIVE_SCAN_SHADOW
+}			IvfflatProgressiveScanMode;
 
 #ifdef IVFFLAT_DISTANCE_PATH
 typedef enum IvfflatDistancePath
@@ -310,6 +318,24 @@ typedef struct IvfflatScanList
 	double		distance;
 }			IvfflatScanList;
 
+typedef struct IvfflatShadowTopItem
+{
+	double		distance;
+	ItemPointerData tid;
+}			IvfflatShadowTopItem;
+
+typedef struct IvfflatShadowSnapshot
+{
+	int			stage;
+	int			count;
+	double		kthDistance;
+	uint64		candidatesSeen;
+	uint64		pagesSeen;
+	uint64		distanceCalls;
+	uint64		replacements;
+	IvfflatShadowTopItem *items;
+}			IvfflatShadowSnapshot;
+
 typedef struct IvfflatScanOpaqueData
 {
 	const		IvfflatTypeInfo *typeInfo;
@@ -380,8 +406,23 @@ typedef struct IvfflatScanOpaqueData
 	pairingheap *listQueue;
 	BlockNumber *listPages;
 	double		 *listDistances;
+	int			listCount;
 	int			listIndex;
 	IvfflatScanList *lists;
+
+	/* Progressive shadow scan */
+	bool		progressiveShadow;
+	int			shadowK;
+	int			shadowCapacity;
+	int			shadowTopCount;
+	int			shadowWorst;
+	IvfflatShadowTopItem *shadowTopItems;
+	IvfflatShadowSnapshot shadowSnapshots[3];
+	uint64		shadowCandidatesSeen;
+	uint64		shadowPagesSeen;
+	uint64		shadowDistanceCalls;
+	uint64		shadowReplacements;
+	uint64		shadowScannedLists;
 }			IvfflatScanOpaqueData;
 
 typedef IvfflatScanOpaqueData * IvfflatScanOpaque;

@@ -28,6 +28,8 @@ double		ivfflat_adaptive_probes_ratio_16;
 double		ivfflat_adaptive_probes_ratio_32;
 double		ivfflat_adaptive_probes_ratio_64;
 int			ivfflat_iterative_scan;
+int			ivfflat_progressive_scan;
+bool		ivfflat_progressive_scan_debug;
 int			ivfflat_max_probes;
 int			ivfflat_experimental_sort_bound;
 bool		ivfflat_bounded_scan;
@@ -42,6 +44,12 @@ static relopt_kind ivfflat_relopt_kind;
 static const struct config_enum_entry ivfflat_iterative_scan_options[] = {
 	{"off", IVFFLAT_ITERATIVE_SCAN_OFF, false},
 	{"relaxed_order", IVFFLAT_ITERATIVE_SCAN_RELAXED, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry ivfflat_progressive_scan_options[] = {
+	{"off", IVFFLAT_PROGRESSIVE_SCAN_OFF, false},
+	{"shadow", IVFFLAT_PROGRESSIVE_SCAN_SHADOW, false},
 	{NULL, 0, false}
 };
 
@@ -89,6 +97,15 @@ IvfflatInit(void)
 	DefineCustomEnumVariable("ivfflat.iterative_scan", "Sets the mode for iterative scans",
 							 NULL, &ivfflat_iterative_scan,
 							 IVFFLAT_ITERATIVE_SCAN_OFF, ivfflat_iterative_scan_options, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("ivfflat.progressive_scan", "Sets the experimental progressive scan mode",
+							 "Shadow scans 16, then 32, then 64 lists and always completes all 64.",
+							 &ivfflat_progressive_scan, IVFFLAT_PROGRESSIVE_SCAN_OFF,
+							 ivfflat_progressive_scan_options, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("ivfflat.progressive_scan_debug", "Emits progressive shadow stage statistics",
+							 "Experimental debug output; disable for latency measurements.",
+							 &ivfflat_progressive_scan_debug, false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	/* If this is less than probes, probes is used */
 	DefineCustomIntVariable("ivfflat.max_probes", "Sets the max number of probes for iterative scans",

@@ -10,10 +10,12 @@
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "lib/pairingheap.h"
+#include "lib/stringinfo.h"
 #include "ivfflat.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "utils/float.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -192,7 +194,11 @@ GetScanLists(IndexScanDesc scan, Datum value)
 	}
 
 	Assert(pairingheap_is_empty(so->listQueue));
-	so->probes = AdaptiveProbeCount(so, listCount);
+	so->listCount = listCount;
+	if (so->progressiveShadow)
+		so->probes = 64;
+	else
+		so->probes = AdaptiveProbeCount(so, listCount);
 
 	if (ivfflat_adaptive_probes_trace && listCount >= 64)
 	{
@@ -217,32 +223,171 @@ GetScanLists(IndexScanDesc scan, Datum value)
 }
 
 /*
- * Get items
+ * Compare shadow results in the same order as the real tuplesort: distance,
+ * then heap TID. This also gives deterministic snapshots for exact ties.
+ */
+static int
+CompareShadowTopItems(const void *va, const void *vb)
+{
+	const IvfflatShadowTopItem *a = (const IvfflatShadowTopItem *) va;
+	const IvfflatShadowTopItem *b = (const IvfflatShadowTopItem *) vb;
+	int			cmp = float8_cmp_internal(a->distance, b->distance);
+
+	if (cmp != 0)
+		return cmp;
+	return ItemPointerCompare((ItemPointer) &a->tid, (ItemPointer) &b->tid);
+}
+
+/*
+ * Observe an already computed candidate distance. No index or heap access and
+ * no distance function call is performed here.
  */
 static void
-GetScanItems(IndexScanDesc scan, Datum value)
+ShadowTopKUpdate(IvfflatScanOpaque so, Datum distanceDatum, ItemPointer tid)
+{
+	IvfflatShadowTopItem candidate;
+
+	if (!so->progressiveShadow)
+		return;
+
+	candidate.distance = DatumGetFloat8(distanceDatum);
+	ItemPointerCopy(tid, &candidate.tid);
+	so->shadowCandidatesSeen++;
+	so->shadowDistanceCalls++;
+
+	if (so->shadowTopCount < so->shadowK)
+	{
+		int			inserted = so->shadowTopCount++;
+
+		so->shadowTopItems[inserted] = candidate;
+		if (inserted == 0 ||
+			CompareShadowTopItems(&so->shadowTopItems[so->shadowWorst],
+								 &candidate) < 0)
+			so->shadowWorst = inserted;
+		return;
+	}
+
+	/* Most candidates need only this one comparison. */
+	if (CompareShadowTopItems(&candidate,
+						  &so->shadowTopItems[so->shadowWorst]) < 0)
+	{
+		so->shadowTopItems[so->shadowWorst] = candidate;
+		so->shadowWorst = 0;
+		for (int i = 1; i < so->shadowTopCount; i++)
+		{
+			if (CompareShadowTopItems(&so->shadowTopItems[so->shadowWorst],
+									 &so->shadowTopItems[i]) < 0)
+				so->shadowWorst = i;
+		}
+		so->shadowReplacements++;
+	}
+}
+
+/*
+ * Persist a stage snapshot in scan state and optionally emit parseable debug
+ * output. The output is entirely gated by progressive_scan_debug.
+ */
+static void
+ShadowSnapshot(IvfflatScanOpaque so, int snapshotIndex, int stage)
+{
+	IvfflatShadowSnapshot *snapshot = &so->shadowSnapshots[snapshotIndex];
+
+	qsort(so->shadowTopItems, so->shadowTopCount,
+		  sizeof(IvfflatShadowTopItem), CompareShadowTopItems);
+	if (so->shadowTopCount > 0)
+		so->shadowWorst = so->shadowTopCount - 1;
+
+	snapshot->stage = stage;
+	snapshot->count = so->shadowTopCount;
+	snapshot->kthDistance = so->shadowTopCount == so->shadowK ?
+		so->shadowTopItems[so->shadowTopCount - 1].distance :
+		get_float8_infinity();
+	snapshot->candidatesSeen = so->shadowCandidatesSeen;
+	snapshot->pagesSeen = so->shadowPagesSeen;
+	snapshot->distanceCalls = so->shadowDistanceCalls;
+	snapshot->replacements = so->shadowReplacements;
+	memcpy(snapshot->items, so->shadowTopItems,
+		   mul_size(sizeof(IvfflatShadowTopItem), so->shadowTopCount));
+
+	if (ivfflat_progressive_scan_debug)
+	{
+		StringInfoData topk;
+		int			previousStage = snapshotIndex == 0 ? 0 :
+			so->shadowSnapshots[snapshotIndex - 1].stage;
+
+		elog(INFO, "IVFFLAT_PROGRESSIVE stage=%d probes_scanned=%d new_lists=%d candidates=%llu pages=%llu distance_calls=%llu replacements=%llu kth_distance=%.17g topk_count=%d list_mask=%016llx",
+			 stage, stage, stage - previousStage,
+			 (unsigned long long) snapshot->candidatesSeen,
+			 (unsigned long long) snapshot->pagesSeen,
+			 (unsigned long long) snapshot->distanceCalls,
+			 (unsigned long long) snapshot->replacements,
+			 snapshot->kthDistance, snapshot->count,
+			 (unsigned long long) so->shadowScannedLists);
+
+		initStringInfo(&topk);
+		for (int i = 0; i < snapshot->count; i++)
+		{
+			BlockNumber block = ItemPointerGetBlockNumber(&snapshot->items[i].tid);
+			OffsetNumber offset = ItemPointerGetOffsetNumber(&snapshot->items[i].tid);
+
+			appendStringInfo(&topk, "%s%u/%u:%.17g", i == 0 ? "" : ",",
+						 block, offset, snapshot->items[i].distance);
+		}
+		elog(INFO, "IVFFLAT_PROGRESSIVE_TOPK stage=%d tids_distances=%s",
+			 stage, topk.data);
+		pfree(topk.data);
+	}
+}
+
+/*
+ * Get items from the half-open ordered-list range [startIndex, endIndex).
+ * resetSort is true only for the first range; performSort is true only for
+ * the final range.
+ */
+static void
+GetScanItemsRange(IndexScanDesc scan, Datum value, int startIndex, int endIndex,
+				  bool resetSort, bool performSort)
 {
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
 	TupleTableSlot *slot = so->vslot;
-	int			batchProbes = 0;
-
 #ifdef IVFFLAT_BENCH
 	instr_time	getitems_start;
+#endif
 
+	Assert(startIndex >= 0);
+	Assert(startIndex == so->listIndex);
+	Assert(endIndex >= startIndex);
+	Assert(endIndex <= so->maxProbes);
+
+#ifdef IVFFLAT_BENCH
 	INSTR_TIME_SET_CURRENT(getitems_start);
 	so->profile_getitems_calls++;
 #endif
 
-	tuplesort_reset(so->sortstate);
-	/* tuplesort_reset() clears the per-batch bounded state */
-	if (so->boundedActive && !so->fallbackTriggered)
-		tuplesort_set_bound(so->sortstate, so->physicalBound);
-
-	/* Search closest probes lists */
-	while (so->listIndex < so->maxProbes && (++batchProbes) <= so->probes)
+	if (resetSort)
 	{
-		BlockNumber searchPage = so->listPages[so->listIndex++];
+		tuplesort_reset(so->sortstate);
+		/* tuplesort_reset() clears the per-batch bounded state */
+		if (so->boundedActive && !so->fallbackTriggered)
+			tuplesort_set_bound(so->sortstate, so->physicalBound);
+	}
+
+	/* Search exactly this range of the closest ordered lists */
+	while (so->listIndex < endIndex)
+	{
+		int			currentListIndex = so->listIndex++;
+		BlockNumber searchPage = so->listPages[currentListIndex];
+
+		if (so->progressiveShadow)
+		{
+			uint64		listBit = UINT64CONST(1) << currentListIndex;
+
+			if ((so->shadowScannedLists & listBit) != 0)
+				elog(ERROR, "IVFFlat progressive shadow attempted to scan list %d twice",
+					 currentListIndex);
+			so->shadowScannedLists |= listBit;
+		}
 
 		/* Search all entry pages for list */
 		while (BlockNumberIsValid(searchPage))
@@ -262,6 +407,8 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #ifdef IVFFLAT_BENCH
 			so->profile_pages++;
 #endif
+			if (so->progressiveShadow)
+				so->shadowPagesSeen++;
 
 			buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, searchPage, RBM_NORMAL, so->bas);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -413,6 +560,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				slot->tts_isnull[0] = false;
 				slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
 				slot->tts_isnull[1] = false;
+				ShadowTopKUpdate(so, slot->tts_values[0], &itup->t_tid);
 				ExecStoreVirtualTuple(slot);
 #ifdef IVFFLAT_PROFILE_2B
 				INSTR_TIME_SET_CURRENT(elapsed);
@@ -449,8 +597,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		}
 	}
 
-#ifdef IVFFLAT_BENCH
+	if (performSort)
 	{
+#ifdef IVFFLAT_BENCH
 		instr_time	sort_start;
 		instr_time	elapsed;
 
@@ -462,10 +611,10 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #ifdef IVFFLAT_PROFILE_2B
 		so->profile_sort_finalize_ns += INSTR_TIME_GET_NANOSEC(elapsed);
 #endif
-	}
 #else
-	tuplesort_performsort(so->sortstate);
+		tuplesort_performsort(so->sortstate);
 #endif
+	}
 
 #ifdef IVFFLAT_BENCH
 	{
@@ -483,6 +632,39 @@ GetScanItems(IndexScanDesc scan, Datum value)
 #if defined(IVFFLAT_MEMORY)
 	elog(INFO, "memory: %zu MB", MemoryContextMemAllocated(CurrentMemoryContext, true) / (1024 * 1024));
 #endif
+}
+
+/* Preserve the original one-batch behavior when progressive scan is off. */
+static void
+GetScanItems(IndexScanDesc scan, Datum value)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+	int			startIndex = so->listIndex;
+	int			endIndex = Min(startIndex + so->probes, so->maxProbes);
+
+	GetScanItemsRange(scan, value, startIndex, endIndex, true, true);
+}
+
+/* Shadow mode always completes 16 -> 32 -> 64 before tuplesort output. */
+static void
+GetProgressiveShadowItems(IndexScanDesc scan, Datum value)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+
+	Assert(so->listIndex == 0);
+	Assert(so->listCount >= 64);
+	Assert(so->maxProbes == 64);
+	Assert(!so->boundedActive);
+
+	GetScanItemsRange(scan, value, 0, 16, true, false);
+	ShadowSnapshot(so, 0, 16);
+	GetScanItemsRange(scan, value, 16, 32, false, false);
+	ShadowSnapshot(so, 1, 32);
+	GetScanItemsRange(scan, value, 32, 64, false, true);
+	ShadowSnapshot(so, 2, 64);
+
+	if (so->shadowScannedLists != UINT64_MAX)
+		elog(ERROR, "IVFFlat progressive shadow did not scan each of 64 lists exactly once");
 }
 
 /*
@@ -641,6 +823,8 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	int			dimensions;
 	int			probes = ivfflat_probes;
 	int			maxProbes;
+	bool		progressiveShadow =
+		ivfflat_progressive_scan == IVFFLAT_PROGRESSIVE_SCAN_SHADOW;
 	MemoryContext oldCtx;
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
@@ -648,16 +832,38 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	/* Get lists and dimensions from metapage */
 	IvfflatGetMetaPageInfo(index, &lists, &dimensions);
 
-	if (ivfflat_iterative_scan != IVFFLAT_ITERATIVE_SCAN_OFF)
-		maxProbes = Max(ivfflat_max_probes, probes);
+	if (progressiveShadow)
+	{
+		if (lists < 64)
+			ereport(ERROR,
+					(errmsg("ivfflat.progressive_scan=shadow requires an index with at least 64 lists")));
+		if (ivfflat_iterative_scan != IVFFLAT_ITERATIVE_SCAN_OFF)
+			ereport(ERROR,
+					(errmsg("ivfflat.progressive_scan=shadow is incompatible with iterative_scan")));
+		if (ivfflat_adaptive_probes)
+			ereport(ERROR,
+					(errmsg("ivfflat.progressive_scan=shadow is incompatible with adaptive_probes")));
+		if (ivfflat_experimental_sort_bound > 0 || ivfflat_bounded_scan)
+			ereport(ERROR,
+					(errmsg("ivfflat.progressive_scan=shadow is incompatible with bounded scan experiments")));
+
+		/* Shadow semantics are fixed at 16 -> 32 -> 64. */
+		probes = 64;
+		maxProbes = 64;
+	}
 	else
-		maxProbes = probes;
+	{
+		if (ivfflat_iterative_scan != IVFFLAT_ITERATIVE_SCAN_OFF)
+			maxProbes = Max(ivfflat_max_probes, probes);
+		else
+			maxProbes = probes;
 
-	if (probes > lists)
-		probes = lists;
+		if (probes > lists)
+			probes = lists;
 
-	if (maxProbes > lists)
-		maxProbes = lists;
+		if (maxProbes > lists)
+			maxProbes = lists;
+	}
 
 	so = palloc_object(IvfflatScanOpaqueData);
 	so->typeInfo = IvfflatGetTypeInfo(index);
@@ -665,6 +871,18 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->probes = probes;
 	so->maxProbes = maxProbes;
 	so->dimensions = dimensions;
+	so->progressiveShadow = progressiveShadow;
+	so->shadowK = 0;
+	so->shadowCapacity = 0;
+	so->shadowTopCount = 0;
+	so->shadowWorst = 0;
+	so->shadowTopItems = NULL;
+	MemSet(so->shadowSnapshots, 0, sizeof(so->shadowSnapshots));
+	so->shadowCandidatesSeen = 0;
+	so->shadowPagesSeen = 0;
+	so->shadowDistanceCalls = 0;
+	so->shadowReplacements = 0;
+	so->shadowScannedLists = 0;
 	so->sortBound = ivfflat_experimental_sort_bound;
 	so->logicalBound = -1;
 	so->physicalBound = 0;
@@ -724,6 +942,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->listQueue = pairingheap_allocate(CompareLists, scan);
 	so->listPages = palloc_array_checked(BlockNumber, maxProbes);
 	so->listDistances = palloc_array_checked(double, maxProbes);
+	so->listCount = 0;
 	so->listIndex = 0;
 	so->lists = palloc_array_checked(IvfflatScanList, maxProbes);
 
@@ -777,6 +996,12 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 	so->boundedExhausted = false;
 	so->fallbackTriggered = false;
 	so->returnedTidsCount = 0;
+
+	if (so->progressiveShadow &&
+		(ivfflat_iterative_scan != IVFFLAT_ITERATIVE_SCAN_OFF ||
+		 ivfflat_adaptive_probes || so->sortBound > 0 || ivfflat_bounded_scan))
+		ereport(ERROR,
+				(errmsg("ivfflat.progressive_scan=shadow cannot be combined with adaptive, iterative, or bounded scan modes")));
 #ifdef IVFFLAT_DISTANCE_PATH
 	if (so->directQueryNeedsFree)
 		pfree(so->directQuery);
@@ -808,7 +1033,63 @@ ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 								  so->physicalBound);
 	so->first = true;
 	pairingheap_reset(so->listQueue);
+	so->listCount = 0;
 	so->listIndex = 0;
+
+	if (so->progressiveShadow)
+	{
+		int64		requestedK = 40;
+
+		/* xs_tuple_bound includes LIMIT+OFFSET when the executor can supply it. */
+		if (so->logicalBound > 0)
+		{
+			if (so->logicalBound > INT_MAX / 4)
+				ereport(ERROR,
+						(errmsg("LIMIT+OFFSET is too large for IVFFlat shadow Top-K")));
+			requestedK = Max(INT64CONST(40), so->logicalBound * 4);
+		}
+		so->shadowK = (int) requestedK;
+
+		if (so->shadowCapacity < so->shadowK)
+		{
+			if (so->shadowTopItems == NULL)
+				so->shadowTopItems = MemoryContextAlloc(so->tmpCtx,
+					mul_size(sizeof(IvfflatShadowTopItem), so->shadowK));
+			else
+				so->shadowTopItems = repalloc_array(so->shadowTopItems,
+					IvfflatShadowTopItem, so->shadowK);
+
+			for (int i = 0; i < 3; i++)
+			{
+				if (so->shadowSnapshots[i].items == NULL)
+					so->shadowSnapshots[i].items = MemoryContextAlloc(so->tmpCtx,
+						mul_size(sizeof(IvfflatShadowTopItem), so->shadowK));
+				else
+					so->shadowSnapshots[i].items = repalloc_array(
+						so->shadowSnapshots[i].items,
+						IvfflatShadowTopItem, so->shadowK);
+			}
+			so->shadowCapacity = so->shadowK;
+		}
+
+		so->shadowTopCount = 0;
+		so->shadowWorst = 0;
+		so->shadowCandidatesSeen = 0;
+		so->shadowPagesSeen = 0;
+		so->shadowDistanceCalls = 0;
+		so->shadowReplacements = 0;
+		so->shadowScannedLists = 0;
+		for (int i = 0; i < 3; i++)
+		{
+			so->shadowSnapshots[i].stage = 0;
+			so->shadowSnapshots[i].count = 0;
+			so->shadowSnapshots[i].kthDistance = get_float8_infinity();
+			so->shadowSnapshots[i].candidatesSeen = 0;
+			so->shadowSnapshots[i].pagesSeen = 0;
+			so->shadowSnapshots[i].distanceCalls = 0;
+			so->shadowSnapshots[i].replacements = 0;
+		}
+	}
 
 	if (so->normprocinfo != NULL && DatumGetPointer(so->value) != NULL)
 	{
@@ -874,7 +1155,10 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 #else
 		GetScanLists(scan, value);
 #endif
-		GetScanItems(scan, value);
+		if (so->progressiveShadow)
+			GetProgressiveShadowItems(scan, value);
+		else
+			GetScanItems(scan, value);
 		so->first = false;
 		so->value = value;
 	}
