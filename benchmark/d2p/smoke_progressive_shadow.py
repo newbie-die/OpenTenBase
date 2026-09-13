@@ -68,6 +68,7 @@ def main():
             for qid, query in enumerate(queries):
                 value = literal(query)
                 cursor.execute("SELECT set_config('ivfflat.progressive_scan','off',false)")
+                cursor.execute("SELECT set_config('ivfflat.progressive_scan_debug','off',false)")
                 connection.notices.clear()
                 cursor.execute(sql, (value, value))
                 fixed = cursor.fetchall()

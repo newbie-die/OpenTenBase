@@ -116,6 +116,28 @@ AdaptiveProbeCount(IvfflatScanOpaque so, int listCount)
 }
 
 /*
+ * Emit the exact ordered list identifiers and centroid distances used by a
+ * scan. This is audit-only output and does not read or reorder any list.
+ */
+static void
+DebugOrderedLists(IvfflatScanOpaque so, int listCount)
+{
+	StringInfoData lists;
+
+	if (!ivfflat_progressive_scan_debug)
+		return;
+
+	initStringInfo(&lists);
+	for (int i = 0; i < listCount; i++)
+		appendStringInfo(&lists, "%s%u:%.17g", i == 0 ? "" : ",",
+						 so->listPages[i], so->listDistances[i]);
+
+	elog(INFO, "IVFFLAT_PROGRESSIVE_LISTS mode=%s count=%d pages_distances=%s",
+		 so->progressiveShadow ? "shadow" : "fixed", listCount, lists.data);
+	pfree(lists.data);
+}
+
+/*
  * Get lists and sort by distance
  */
 static void
@@ -195,6 +217,7 @@ GetScanLists(IndexScanDesc scan, Datum value)
 
 	Assert(pairingheap_is_empty(so->listQueue));
 	so->listCount = listCount;
+	DebugOrderedLists(so, listCount);
 	if (so->progressiveShadow)
 		so->probes = 64;
 	else
