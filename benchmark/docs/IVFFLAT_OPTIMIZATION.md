@@ -13,6 +13,7 @@
 - 所有核心代码保存在 OpenTenBase 仓库，数据、日志和结果保存在 `/workspace/benchmark`。
 
 ## 2. 完成的优化
+![alt text](流程图.png)
 
 ### 2.1 LIMIT 感知的 Top-K 排序优化
 
