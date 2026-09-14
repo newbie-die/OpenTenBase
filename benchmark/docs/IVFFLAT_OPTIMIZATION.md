@@ -206,6 +206,18 @@ benchmark/scripts/benchmark.py run final-multi \
 /workspace/benchmark/runs/final_multi_formal_repro/final_comparison.json
 ```
 
+### 4.4 单条复杂查询演示
+
+仓库提供 `benchmark/scripts/demo_ivfflat_query.py`，默认演示 GloVe-Cosine 的 qid 7097。这是两个正式 rounds 中 Baseline/2A 结果和 Recall 均一致的查询里，提升最高的一条：延迟分别为 `63.204 -> 12.763 ms` 和 `54.245 -> 13.692 ms`，两轮 speedup 为 `4.952×` 和 `3.962×`，几何平均为 `4.429×`，Recall@10 均为 `1.0`。
+
+交互演示命令：
+
+```bash
+benchmark/scripts/demo_ivfflat_query.py --pause
+```
+
+脚本先预热两个路径，再展示 SQL、query vector 和 ground truth。按两次 Enter 后依次运行无优化 Baseline 和最优 2A，每次都会打印查询结果、Recall@10 和查询时间，最后检查结果一致性并显示现场 speedup。默认查询会完整显示 100 维向量；自定义高维查询默认只显示头尾，需要完整向量时添加 `--show-full-vector`。也可通过 `--dataset` 和 `--qid` 选择其他正式查询。
+
 ## 5. 结果总结
 
 - 通用 LIMIT Top-K 优化在五个 workload 上为 `1.534× ~ 2.176×`，speedup 几何平均为 `1.831×`，Recall 不变。
