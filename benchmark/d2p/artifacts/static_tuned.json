@@ -1,34 +1,34 @@
 {
-  "average_candidates": 134170.778,
+  "average_candidates": 134695.436,
   "average_probes": 64.0,
-  "fixed64_recall": 0.9795,
-  "mean_recall": 0.9795,
+  "fixed64_recall": 0.9825,
+  "mean_recall": 0.9825,
   "p_static": 64,
   "recall_delta": 0.0,
-  "target_recall": 0.9745,
+  "target_recall": 0.9775,
   "tested_probes": [
     {
-      "mean_recall": 0.8366,
+      "mean_recall": 0.848,
       "probes": 16
     },
     {
-      "mean_recall": 0.932,
+      "mean_recall": 0.9355,
       "probes": 32
     },
     {
-      "mean_recall": 0.952,
+      "mean_recall": 0.9541000000000001,
       "probes": 40
     },
     {
-      "mean_recall": 0.9635,
+      "mean_recall": 0.9663999999999999,
       "probes": 48
     },
     {
-      "mean_recall": 0.9726,
+      "mean_recall": 0.9749,
       "probes": 56
     },
     {
-      "mean_recall": 0.9795,
+      "mean_recall": 0.9825,
       "probes": 64
     }
   ]

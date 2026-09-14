@@ -17,11 +17,12 @@ import math
 import time
 from pathlib import Path
 
-SCRIPT_ROOT = Path(__file__).resolve().parent.parent
-WORKSPACE_ROOT = SCRIPT_ROOT.parent.parent
-ROOT = Path(
-    os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")
-).resolve()
+from benchmark_paths import BenchmarkPaths
+
+PATHS = BenchmarkPaths.from_environment()
+SCRIPT_ROOT = PATHS.source
+WORKSPACE_ROOT = PATHS.workspace
+ROOT = PATHS.runtime
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE\s+(.*)")
 PROFILE_2B_RE = re.compile(r"IVFFLAT_PROFILE_2B\s+(.*)")
 FIELD_RE = re.compile(r"([a-z0-9_]+)=(-?[0-9.]+)")
@@ -1508,7 +1509,7 @@ def phase_c_hash(path):
 
 def phase_c_prepare(args, root):
     repo = SCRIPT_ROOT.parent
-    pristine = Path(os.environ.get('PRISTINE_WORKTREE', '/workspace/OpenTenBase-pristine'))
+    pristine = Path(os.environ.get('PRISTINE_WORKTREE', WORKSPACE_ROOT / 'OpenTenBase-pristine'))
     commit = os.environ.get('PRISTINE_COMMIT')
     if not commit:
         raise RuntimeError('PRISTINE_COMMIT must be explicitly supplied')
@@ -1549,7 +1550,7 @@ def phase_c_prepare(args, root):
     compiler = phase_c_command(['gcc', '--version'])
     if phase_c_command(['gcc', '-dumpfullversion']) != '11.5.0':
         raise RuntimeError('GCC 11.5.0 is required')
-    pg_config = os.environ.get('PG_CONFIG', '/workspace/install/bin/pg_config')
+    pg_config = os.environ.get('PG_CONFIG', str(PATHS.install / 'bin/pg_config'))
     metadata = {'pristine_commit': commit, 'optimized_commit': optimized,
                 'optimized_pgvector_tree': git('rev-parse', 'HEAD:contrib/pgvector'),
                 'pristine_pgvector_tree': git('rev-parse', commit + ':contrib/pgvector'),
@@ -1594,8 +1595,8 @@ def phase_c_activate(args, root, metadata, binary):
     expected = metadata[binary + '_binary_sha256']
     if phase_c_hash(source) != expected:
         raise RuntimeError('Archived binary hash mismatch')
-    pg_ctl = os.environ.get('PG_CTL', '/workspace/install/bin/pg_ctl')
-    data = os.environ.get('PGDATA', '/workspace/data')
+    pg_ctl = os.environ.get('PG_CTL', str(PATHS.install / 'bin/pg_ctl'))
+    data = os.environ.get('PGDATA', str(PATHS.pgdata))
     os_user = os.environ.get('PG_OS_USER', 'dev')
     command = (['runuser', '-u', os_user, '--'] if os.getuid() == 0 else []) + [pg_ctl, '-D', data]
     # Stop/start even if the on-disk hash matches: existing backends could have loaded another image.
@@ -1778,7 +1779,7 @@ def phase_c_part1(args, root):
             raise RuntimeError('Build metadata differs from manifest')
         if phase_c_hash(CONFIGS['gist-l2']['dataset']) != manifest['dataset_sha256']:
             raise RuntimeError('Dataset changed since audit')
-        if phase_c_hash('/workspace/install/bin/postgres') != manifest['postgres_sha256']:
+        if phase_c_hash(PATHS.install / 'bin/postgres') != manifest['postgres_sha256']:
             raise RuntimeError('PostgreSQL binary changed since initial run')
     else:
         if manifest_path.exists():
@@ -1949,7 +1950,7 @@ def phase_c_formal_manifest(args, root):
     # A framework-only commit after Part 1 must not relabel the binary source commit.
     if phase_c_command(['git', '-C', SCRIPT_ROOT.parent, 'diff', part1['optimized_commit'], '--', 'contrib/pgvector', 'src']):
         raise RuntimeError('Algorithm/server source differs from Part 1')
-    pg_config = os.environ.get('PG_CONFIG', '/workspace/install/bin/pg_config')
+    pg_config = os.environ.get('PG_CONFIG', str(PATHS.install / 'bin/pg_config'))
     if phase_c_hash(Path(pg_config).with_name('postgres')) != part1['postgres_sha256']:
         raise RuntimeError('PostgreSQL executable changed since Part 1')
     if phase_c_hash(CONFIGS['gist-l2']['dataset']) != part1['dataset_sha256']:
@@ -2187,6 +2188,10 @@ def phase_c_part2(args, root):
 
 
 def main():
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "final-multi":
+        from final_multi import main as final_multi_main
+        return final_multi_main(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5432)

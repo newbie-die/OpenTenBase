@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# Build provenance belongs in the runtime run directory.
+/d0b/build_command.json
+/d1_1/build_command.json

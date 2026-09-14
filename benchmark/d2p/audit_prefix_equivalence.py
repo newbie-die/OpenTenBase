@@ -6,11 +6,14 @@ import argparse
 import collections
 import json
 import math
+import os
 import re
 import time
 from pathlib import Path
 
-DATASET = Path("/workspace/benchmark/data/gist1m/gist-960-euclidean.hdf5")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+RUNTIME_ROOT = Path(os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")).resolve()
+DATASET = Path(os.environ.get("D2P_DATASET", RUNTIME_ROOT / "data/gist1m/gist-960-euclidean.hdf5"))
 PROBES = (16, 32, 64)
 FIELD_RE = re.compile(r"([a-z0-9_]+)=([^ ]+)")
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE_2B (.*)")

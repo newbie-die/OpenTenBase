@@ -118,7 +118,7 @@ def tree_json(tree, names):
         if tree.tree_.feature[index] == _tree.TREE_UNDEFINED:
             counts = tree.tree_.value[index][0]
             total = float(sum(counts))
-            return {"safe_probability": float(counts[1] / total if total else 0.0),
+            return {"safe_probability": float(counts[list(tree.classes_).index(1)] / total if total and 1 in tree.classes_ else 0.0),
                     "samples": int(tree.tree_.n_node_samples[index])}
         feature = names[tree.tree_.feature[index]]
         return {"feature": feature, "threshold": float(tree.tree_.threshold[index]),
@@ -232,7 +232,9 @@ def main():
                 model = DecisionTreeClassifier(max_depth=depth, min_samples_leaf=leaf,
                                                random_state=SEED)
                 model.fit(matrix[train], labels[train])
-                probabilities[validation] = model.predict_proba(matrix[validation])[:, 1]
+                # A clean dataset may have a single safe/unsafe class in a fold.
+                probabilities[validation] = (model.predict_proba(matrix[validation])[:, list(model.classes_).index(1)]
+                                             if 1 in model.classes_ else 0.0)
                 models.append(model)
             fold_metrics.append({"fold": fold, "validation_qids": int(validation.sum())})
         p16 = {qid: float(probabilities16[qid]) for qid in qids}

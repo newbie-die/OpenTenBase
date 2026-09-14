@@ -8,9 +8,14 @@ import statistics
 import time
 from pathlib import Path
 
-DEFAULT_DATASET = Path("/workspace/benchmark/data/gist1m/gist-960-euclidean.hdf5")
-POLICY = Path("/workspace/OpenTenBase/benchmark/d2p/artifacts/d2p_policy.json")
-STATIC = Path("/workspace/OpenTenBase/benchmark/d2p/artifacts/static_tuned.json")
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = SOURCE_ROOT.parent.parent
+RUNTIME_ROOT = Path(os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")).resolve()
+# Combined HDF5: test[0:1000]=gist_learn calibration, test[1000:2000]=official
+# GIST test (formal holdout, never used for calibration).
+DEFAULT_DATASET = RUNTIME_ROOT / "data/gist1m/gist-960-euclidean-formal.hdf5"
+POLICY = SOURCE_ROOT / "d2p/artifacts/d2p_policy.json"
+STATIC = SOURCE_ROOT / "d2p/artifacts/static_tuned.json"
 CONFIGS = ("fixed16", "fixed32", "fixed64", "static_tuned", "d2p")
 FIELDS = ("qid", "config", "latency_ms", "latency_us", "recall_at_10", "probes", "candidates",
           "pages", "distance_calls", "stop_stage", "result_ids")
@@ -35,7 +40,7 @@ def dataset_path():
 def validate_holdout(output=None):
     import h5py
     path = dataset_path()
-    result = {"dataset": str(path), "required_qids": [1000, 9999], "status": "FAIL"}
+    result = {"dataset": str(path), "required_qids": [1000, 1999], "status": "FAIL"}
     if not path.exists():
         result["reason"] = "dataset does not exist"
     else:
@@ -43,8 +48,8 @@ def validate_holdout(output=None):
             result["test_rows"] = int(source["test"].shape[0])
             result["neighbor_rows"] = int(source["neighbors"].shape[0])
             result["dimensions"] = int(source["test"].shape[1])
-        if result["test_rows"] < 10000 or result["neighbor_rows"] < 10000:
-            result["reason"] = "GIST holdout qids 1000..9999 and matching GT are absent"
+        if result["test_rows"] < 2000 or result["neighbor_rows"] < 2000:
+            result["reason"] = "GIST holdout qids 1000..1999 and matching GT are absent"
         elif result["dimensions"] != 960:
             result["reason"] = "holdout dimension does not match the existing GIST1M index"
         else:
@@ -56,7 +61,7 @@ def validate_holdout(output=None):
             "status": "PREFLIGHT_PASS" if result["status"] == "PASS" else "BLOCKED",
             "current_config": "preflight",
             "completed_queries": 0,
-            "total_queries": len(CONFIGS) * 9000,
+            "total_queries": len(CONFIGS) * 1000,
             "elapsed_seconds": 0.0,
             "ETA_seconds": None,
             "reason": result.get("reason"),
@@ -117,8 +122,8 @@ def summarize(rows, baseline_recall=None):
 def run(conn, args):
     import h5py
     output = args.output
-    if args.queries != 9000 or args.topk != 10 or args.lists != 1000 or args.warmup < 0:
-        raise ValueError("all-fomal-exp requires queries=9000, topk=10, lists=1000 and nonnegative warmup")
+    if args.queries != 1000 or args.topk != 10 or args.lists != 1000 or args.warmup < 0:
+        raise ValueError("all-fomal-exp requires queries=1000, topk=10, lists=1000 and nonnegative warmup")
     output.mkdir(parents=True, exist_ok=True)
     preflight = validate_holdout(output)
     if not POLICY.exists() or not STATIC.exists():
@@ -128,7 +133,7 @@ def run(conn, args):
     p_static = int(static["p_static"])
     manifest = {
         "status": "RUNNING", "phase": "all-fomal-exp", "rounds": 1,
-        "qid_range": [1000, 9999], "query_order": "ascending", "configs": list(CONFIGS),
+        "qid_range": [1000, 1999], "query_order": "ascending", "configs": list(CONFIGS),
         "warmup_per_config": args.warmup, "limit": 10, "lists": 1000,
         "dataset": preflight, "policy_sha256": sha256(POLICY),
         "static_sha256": sha256(STATIC), "p_static": p_static,
@@ -136,12 +141,12 @@ def run(conn, args):
     }
     atomic_json(output / "manifest.json", manifest)
     atomic_json(output / "plan.json", {
-        "config_order": list(CONFIGS), "qid_order": list(range(1000, 10000)),
+        "config_order": list(CONFIGS), "qid_order": list(range(1000, 2000)),
         "checkpoint": "one append-flushed CSV per config; resume at next qid",
     })
     with h5py.File(dataset_path(), "r") as source:
-        queries = source["test"][1000:10000]
-        truths = [set(map(int, row[:10])) for row in source["neighbors"][1000:10000]]
+        queries = source["test"][1000:2000]
+        truths = [set(map(int, row[:10])) for row in source["neighbors"][1000:2000]]
 
     started = time.perf_counter()
     completed_total = 0
@@ -162,7 +167,7 @@ def run(conn, args):
             rows = read_rows(raw_path)
             completed_total += len(rows)
             summary_path = config_dir / "summary.json"
-            if len(rows) == 9000:
+            if len(rows) == 1000:
                 if not summary_path.exists():
                     raise RuntimeError(f"complete raw checkpoint lacks summary: {config}")
                 saved_summary = json.loads(summary_path.read_text())
@@ -188,7 +193,7 @@ def run(conn, args):
             with raw_path.open(mode, newline="", buffering=1) as target:
                 writer = csv.DictWriter(target, fieldnames=FIELDS)
                 if mode == "w": writer.writeheader()
-                for offset in range(len(rows), 9000):
+                for offset in range(len(rows), 1000):
                     qid = offset + 1000
                     literal = vector_literal(queries[offset])
                     conn.notices.clear()
@@ -212,10 +217,10 @@ def run(conn, args):
                            "stop_stage": stop_stage, "result_ids": ";".join(map(str, ids))}
                     writer.writerow(row); target.flush(); rows.append(row); completed_total += 1
                     elapsed = time.perf_counter() - started
-                    remaining = len(CONFIGS) * 9000 - completed_total
+                    remaining = len(CONFIGS) * 1000 - completed_total
                     progress = {"status": "RUNNING", "current_config": f"{config_index}/{len(CONFIGS)} {config}",
                                 "completed_queries": completed_total,
-                                "total_queries": len(CONFIGS) * 9000, "current_qid": qid,
+                                "total_queries": len(CONFIGS) * 1000, "current_qid": qid,
                                 "elapsed_seconds": elapsed,
                                 "ETA_seconds": elapsed * remaining / completed_total if completed_total else None}
                     atomic_json(output / "progress.json", progress)
@@ -262,6 +267,6 @@ def run(conn, args):
     manifest["status"] = "COMPLETE"; manifest["gate"] = gate
     atomic_json(output / "manifest.json", manifest)
     atomic_json(output / "progress.json", {"status": "COMPLETE", "current_config": "5/5 d2p",
-                                            "completed_queries": 45000, "total_queries": 45000,
+                                            "completed_queries": 5000, "total_queries": 5000,
                                             "elapsed_seconds": time.perf_counter() - started,
                                             "ETA_seconds": 0.0})

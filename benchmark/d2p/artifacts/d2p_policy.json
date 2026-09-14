@@ -5,23 +5,23 @@
   ],
   "class_weight": null,
   "fold": "query_id % 5",
-  "go_vs_static": true,
+  "go_vs_static": false,
   "max_depth": 3,
   "min_samples_leaf": 40,
   "model": "DecisionTreeClassifier",
   "oof_metrics": {
-    "average_candidates": 103714.192,
-    "average_distance_calls": 103714.192,
-    "average_pages": 51870.234,
-    "average_probes": 50.88,
-    "baseline_recall": 0.9795,
+    "average_candidates": 98686.495,
+    "average_distance_calls": 98686.495,
+    "average_pages": 49355.689,
+    "average_probes": 48.032,
+    "baseline_recall": 0.9825,
     "distribution": {
-      "16": 100,
-      "32": 260,
-      "64": 640
+      "16": 148,
+      "32": 277,
+      "64": 575
     },
-    "mean_recall": 0.9747,
-    "recall_delta": -0.0048000000000000265
+    "mean_recall": 0.9775,
+    "recall_delta": -0.0050000000000000044
   },
   "p_static": 64,
   "seed": 20260913,
@@ -55,66 +55,66 @@
     "s16_replacement_rate",
     "s16_candidates_per_page"
   ],
-  "stage16_threshold": 0.95,
+  "stage16_threshold": 0.925,
   "stage16_tree": {
     "feature": "d32_d1",
     "if_gt": {
+      "feature": "d32_d1",
+      "if_gt": {
+        "feature": "d32_d1",
+        "if_gt": {
+          "safe_probability": 0.9924812030075187,
+          "samples": 133
+        },
+        "if_le": {
+          "safe_probability": 0.8360655737704918,
+          "samples": 61
+        },
+        "threshold": 1.808931589126587
+      },
+      "if_le": {
+        "feature": "d2_d1",
+        "if_gt": {
+          "safe_probability": 0.37623762376237624,
+          "samples": 101
+        },
+        "if_le": {
+          "safe_probability": 0.7,
+          "samples": 120
+        },
+        "threshold": 1.0805763602256775
+      },
+      "threshold": 1.6509846448898315
+    },
+    "if_le": {
       "feature": "d64_d1",
       "if_gt": {
         "feature": "d4_d1",
         "if_gt": {
-          "safe_probability": 1.0,
-          "samples": 84
-        },
-        "if_le": {
-          "safe_probability": 0.9,
-          "samples": 40
-        },
-        "threshold": 1.2957057356834412
-      },
-      "if_le": {
-        "feature": "s16_replacement_rate",
-        "if_gt": {
-          "safe_probability": 0.6346153846153846,
-          "samples": 104
-        },
-        "if_le": {
-          "safe_probability": 0.8809523809523809,
+          "safe_probability": 0.19047619047619047,
           "samples": 42
         },
-        "threshold": 0.00501527008600533
-      },
-      "threshold": 2.12930166721344
-    },
-    "if_le": {
-      "feature": "d32_d1",
-      "if_gt": {
-        "feature": "s16_pages",
-        "if_gt": {
-          "safe_probability": 0.4787234042553192,
-          "samples": 94
-        },
         "if_le": {
-          "safe_probability": 0.2910662824207493,
-          "samples": 347
+          "safe_probability": 0.4470588235294118,
+          "samples": 85
         },
-        "threshold": 21184.0
+        "threshold": 1.1515732407569885
       },
       "if_le": {
-        "feature": "d64_d1",
+        "feature": "gap32_16_d1",
         "if_gt": {
-          "safe_probability": 0.1164021164021164,
-          "samples": 189
+          "safe_probability": 0.23756906077348067,
+          "samples": 181
         },
         "if_le": {
-          "safe_probability": 0.0,
-          "samples": 100
+          "safe_probability": 0.09386281588447654,
+          "samples": 277
         },
-        "threshold": 1.3067447543144226
+        "threshold": 0.07987291738390923
       },
-      "threshold": 1.294619083404541
+      "threshold": 1.5011770129203796
     },
-    "threshold": 1.5485947728157043
+    "threshold": 1.4477165341377258
   },
   "stage32_features": [
     "d1",
@@ -161,67 +161,67 @@
     "mean10_relative_change_16_32",
     "candidate_growth_16_32"
   ],
-  "stage32_threshold": 0.8504672897196262,
+  "stage32_threshold": 0.7936507936507936,
   "stage32_tree": {
     "feature": "d64_d1",
     "if_gt": {
-      "feature": "d64_d1",
+      "feature": "d32_d1",
       "if_gt": {
-        "feature": "kth10_relative_change_16_32",
+        "feature": "candidate_growth_16_32",
         "if_gt": {
-          "safe_probability": 0.875,
-          "samples": 40
+          "safe_probability": 0.9230769230769231,
+          "samples": 65
         },
         "if_le": {
-          "safe_probability": 0.9829059829059829,
-          "samples": 234
+          "safe_probability": 0.9946236559139785,
+          "samples": 186
         },
-        "threshold": 0.0027708339039236307
+        "threshold": 1.1196491718292236
       },
       "if_le": {
-        "feature": "s32_replacement_rate",
+        "feature": "candidate_growth_16_32",
         "if_gt": {
-          "safe_probability": 0.6696428571428571,
-          "samples": 112
+          "safe_probability": 0.7349397590361446,
+          "samples": 83
         },
         "if_le": {
-          "safe_probability": 0.8394160583941606,
-          "samples": 137
+          "safe_probability": 0.9136690647482014,
+          "samples": 139
         },
-        "threshold": 0.0035484861582517624
+        "threshold": 1.0391929149627686
       },
-      "threshold": 1.7157695889472961
+      "threshold": 1.5726179480552673
     },
     "if_le": {
-      "feature": "gap64_32_d1",
+      "feature": "s16_candidates",
       "if_gt": {
-        "feature": "d16",
+        "feature": "gap32_16_d1",
         "if_gt": {
-          "safe_probability": 0.75,
-          "samples": 76
+          "safe_probability": 0.9069767441860465,
+          "samples": 43
         },
         "if_le": {
-          "safe_probability": 0.5021097046413502,
-          "samples": 237
+          "safe_probability": 0.5846153846153846,
+          "samples": 65
         },
-        "threshold": 1.6238608360290527
+        "threshold": 0.09462502226233482
       },
       "if_le": {
-        "feature": "s32_top10_std",
+        "feature": "d64",
         "if_gt": {
-          "safe_probability": 0.6363636363636364,
-          "samples": 44
+          "safe_probability": 0.5902777777777778,
+          "samples": 144
         },
         "if_le": {
-          "safe_probability": 0.275,
-          "samples": 120
+          "safe_probability": 0.36363636363636365,
+          "samples": 275
         },
-        "threshold": 0.06327231600880623
+        "threshold": 2.135347843170166
       },
-      "threshold": 0.09100430831313133
+      "threshold": 39234.5
     },
-    "threshold": 1.5021027326583862
+    "threshold": 1.5536543130874634
   },
-  "target_recall": 0.9745,
+  "target_recall": 0.9775,
   "version": "D2-P"
 }

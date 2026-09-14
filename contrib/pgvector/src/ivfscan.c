@@ -684,6 +684,7 @@ D2PBuildFeatures(IvfflatScanOpaque so, D2PFeatures *features, int stage)
 	Assert(snapshot->count >= 10);
 	MemSet(features, 0, sizeof(*features));
 	features->d16 = so->listDistances[15];
+	features->d64 = so->listDistances[63];
 	if (d1 != 0)
 	{
 		features->d4_d1 = so->listDistances[3] / d1;
@@ -691,9 +692,13 @@ D2PBuildFeatures(IvfflatScanOpaque so, D2PFeatures *features, int stage)
 		features->d64_d1 = so->listDistances[63] / d1;
 		features->gap64_32_d1 =
 			(so->listDistances[63] - so->listDistances[31]) / d1;
+		features->d2_d1 = so->listDistances[1] / d1;
+		features->gap32_16_d1 =
+			(so->listDistances[31] - so->listDistances[15]) / d1;
 	}
 
 	features->s16_pages = (double) so->shadowSnapshots[0].pagesSeen;
+	features->s16_candidates = (double) so->shadowSnapshots[0].candidatesSeen;
 	if (so->shadowSnapshots[0].candidatesSeen > 0)
 		features->s16_replacement_rate =
 			(double) so->shadowSnapshots[0].replacements /
@@ -714,6 +719,10 @@ D2PBuildFeatures(IvfflatScanOpaque so, D2PFeatures *features, int stage)
 		if (snapshot->candidatesSeen > 0)
 			features->s32_replacement_rate =
 				(double) snapshot->replacements / (double) snapshot->candidatesSeen;
+		if (so->shadowSnapshots[0].candidatesSeen > 0)
+			features->candidate_growth_16_32 =
+				(double) (snapshot->candidatesSeen - so->shadowSnapshots[0].candidatesSeen) /
+				(double) so->shadowSnapshots[0].candidatesSeen;
 		if (so->shadowSnapshots[0].items[9].distance != 0)
 			features->kth10_relative_change_16_32 =
 				(so->shadowSnapshots[0].items[9].distance - snapshot->items[9].distance) /

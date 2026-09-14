@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Small fixed-probes=64 versus progressive-shadow correctness smoke."""
 import argparse
+import os
 import re
+from pathlib import Path
 
-DATASET = "/workspace/benchmark/data/gist1m/gist-960-euclidean.hdf5"
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+RUNTIME_ROOT = Path(os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")).resolve()
+DATASET = str(Path(os.environ.get("D2P_DATASET", RUNTIME_ROOT / "data/gist1m/gist-960-euclidean.hdf5")))
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE_2B (.*)")
 
 

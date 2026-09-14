@@ -1,32 +1,32 @@
 {
   "d2p": {
-    "average_candidates": 103714.192,
-    "average_distance_calls": 103714.192,
-    "average_pages": 51870.234,
-    "average_probes": 50.88,
-    "baseline_recall": 0.9795,
+    "average_candidates": 98686.495,
+    "average_distance_calls": 98686.495,
+    "average_pages": 49355.689,
+    "average_probes": 48.032,
+    "baseline_recall": 0.9825,
     "distribution": {
-      "16": 100,
-      "32": 260,
-      "64": 640
+      "16": 148,
+      "32": 277,
+      "64": 575
     },
-    "mean_recall": 0.9747,
-    "recall_delta": -0.0048000000000000265
+    "mean_recall": 0.9775,
+    "recall_delta": -0.0050000000000000044
   },
   "fixed64": {
-    "average_candidates": 134170.778,
-    "average_distance_calls": 134170.778,
-    "average_pages": 67101.748,
+    "average_candidates": 134695.436,
+    "average_distance_calls": 134695.436,
+    "average_pages": 67364.04,
     "average_probes": 64.0,
-    "mean_recall": 0.9795,
+    "mean_recall": 0.9825,
     "recall_delta": 0.0
   },
   "static_tuned": {
-    "average_candidates": 134170.778,
-    "average_distance_calls": 134170.778,
-    "average_pages": 67101.748,
+    "average_candidates": 134695.436,
+    "average_distance_calls": 134695.436,
+    "average_pages": 67364.04,
     "average_probes": 64.0,
-    "mean_recall": 0.9795,
+    "mean_recall": 0.9825,
     "recall_delta": 0.0
   }
 }

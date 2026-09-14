@@ -199,6 +199,23 @@ else:
         self.assertEqual(final[-8:], ['--baseline-path', 'direct', '--test-path', 'fused2',
                                       '--queries', '3', '--warmup', '0'])
 
+    def test_launcher_accepts_explicit_runtime_run_directory(self):
+        explicit = self.root / 'explicit-run'
+        r = subprocess.run(['bash', str(ROOT / 'benchmark/scripts/run_ivfflat_experiments.sh'),
+                            '2b-correctness', '--run-dir', str(explicit),
+                            '--baseline-path', 'direct', '--test-path', 'fused2'],
+                           env=self.env, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        status = None
+        for _ in range(100):
+            if (explicit / 'status').exists():
+                status = (explicit / 'status').read_text().strip()
+                if status != 'running':
+                    break
+            time.sleep(0.05)
+        self.assertEqual(status, 'complete')
+        self.assertTrue((explicit / 'experiment.log').is_file())
+
 
     def test_profile_cli_paths_select_fused2_output_name(self):
         r = self.run_worker('2b', '--distance-path', 'interleaved',

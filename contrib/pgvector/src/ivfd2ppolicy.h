@@ -1,6 +1,8 @@
 /*
  * Frozen D2-P shallow-tree policy.
- * Artifact SHA256: ebc40ce4f5d5615359f4c1846216964fa02d8939fe303f49a54c849ff5027d20
+ * Calibrated on gist_learn (qids 0..999); the official GIST 1000 test queries
+ * are reserved as the formal holdout and were never used for calibration.
+ * Artifact SHA256: ef2afdd7d04d91706769a7d43d728da67f873daf0a0c6376b389ab991d8ef8a5
  */
 typedef struct D2PFeatures
 {
@@ -14,59 +16,64 @@ typedef struct D2PFeatures
 	double s32_top10_std;
 	double s32_replacement_rate;
 	double kth10_relative_change_16_32;
+	double gap32_16_d1;
+	double d2_d1;
+	double s16_candidates;
+	double d64;
+	double candidate_growth_16_32;
 } D2PFeatures;
 
-static inline double
-D2PStage16SafeProbability(D2PFeatures f)
+static inline double D2PStage16SafeProbability(D2PFeatures f)
 {
-	if (f.d32_d1 <= 1.5485947728157043)
-	{
-		if (f.d32_d1 <= 1.294619083404541)
-		{
-			if (f.d64_d1 <= 1.3067447543144226)
-				return 0;
-			return 0.1164021164021164;
-		}
-		if (f.s16_pages <= 21184)
-			return 0.29106628242074928;
-		return 0.47872340425531917;
-	}
-	if (f.d64_d1 <= 2.1293016672134399)
-	{
-		if (f.s16_replacement_rate <= 0.0050152700860053301)
-			return 0.88095238095238093;
-		return 0.63461538461538458;
-	}
-	if (f.d4_d1 <= 1.2957057356834412)
-		return 0.90000000000000002;
-	return 1;
+	if (f.d32_d1 <= 1.4477165341377258)
+		if (f.d64_d1 <= 1.5011770129203796)
+			if (f.gap32_16_d1 <= 0.079872917383909225)
+				return 0.093862815884476536;
+			else
+				return 0.23756906077348067;
+		else
+			if (f.d4_d1 <= 1.1515732407569885)
+				return 0.44705882352941179;
+			else
+				return 0.19047619047619047;
+	else
+		if (f.d32_d1 <= 1.6509846448898315)
+			if (f.d2_d1 <= 1.0805763602256775)
+				return 0.69999999999999996;
+			else
+				return 0.37623762376237624;
+		else
+			if (f.d32_d1 <= 1.8089315891265869)
+				return 0.83606557377049184;
+			else
+				return 0.99248120300751874;
 }
 
-static inline double
-D2PStage32SafeProbability(D2PFeatures f)
+static inline double D2PStage32SafeProbability(D2PFeatures f)
 {
-	if (f.d64_d1 <= 1.5021027326583862)
-	{
-		if (f.gap64_32_d1 <= 0.091004308313131332)
-		{
-			if (f.s32_top10_std <= 0.063272316008806229)
-				return 0.27500000000000002;
-			return 0.63636363636363635;
-		}
-		if (f.d16 <= 1.6238608360290527)
-			return 0.50210970464135019;
-		return 0.75;
-	}
-	if (f.d64_d1 <= 1.7157695889472961)
-	{
-		if (f.s32_replacement_rate <= 0.0035484861582517624)
-			return 0.83941605839416056;
-		return 0.6696428571428571;
-	}
-	if (f.kth10_relative_change_16_32 <= 0.0027708339039236307)
-		return 0.98290598290598286;
-	return 0.875;
+	if (f.d64_d1 <= 1.5536543130874634)
+		if (f.s16_candidates <= 39234.5)
+			if (f.d64 <= 2.135347843170166)
+				return 0.36363636363636365;
+			else
+				return 0.59027777777777779;
+		else
+			if (f.gap32_16_d1 <= 0.094625022262334824)
+				return 0.58461538461538465;
+			else
+				return 0.90697674418604646;
+	else
+		if (f.d32_d1 <= 1.5726179480552673)
+			if (f.candidate_growth_16_32 <= 1.0391929149627686)
+				return 0.91366906474820142;
+			else
+				return 0.73493975903614461;
+		else
+			if (f.candidate_growth_16_32 <= 1.1196491718292236)
+				return 0.9946236559139785;
+			else
+				return 0.92307692307692313;
 }
 
-#define D2P_STAGE16_THRESHOLD 0.94999999999999996
-#define D2P_STAGE32_THRESHOLD 0.85046728971962615
+#define D2P_STAGE16_THRESHOLD 0.92500000000000004
+#define D2P_STAGE32_THRESHOLD 0.79365079365079361

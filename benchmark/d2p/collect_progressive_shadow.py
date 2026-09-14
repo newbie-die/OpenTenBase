@@ -3,12 +3,22 @@
 import argparse
 import csv
 import json
+import os
 import re
 import statistics
 import time
 from pathlib import Path
 
-DATASET = Path("/workspace/benchmark/data/gist1m/gist-960-euclidean.hdf5")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+RUNTIME_ROOT = Path(os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")).resolve()
+DATASET = Path(os.environ.get("D2P_DATASET",
+                              RUNTIME_ROOT / "data/gist1m/gist-960-euclidean.hdf5"))
+# Dataset parameters share the original collector and feature definitions.
+TABLE = os.environ.get("D2P_TABLE", "gist_base")
+INDEX = os.environ.get("D2P_INDEX", "gist_ivf_l2")
+if (TABLE, INDEX) not in (("gist_base", "gist_ivf_l2"), ("sift_base", "sift_ivf_l2")):
+    raise ValueError("Only audited L2 calibration workloads are allowed")
+
 STAGES = (16, 32, 64)
 FIELD_RE = re.compile(r"([a-z0-9_]+)=([^ ]+)")
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE_2B (.*)")
@@ -136,7 +146,7 @@ def main():
         with connection.cursor() as cursor:
             cursor.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
             cursor.execute("SET LOCAL lock_timeout=10000")
-            cursor.execute("LOCK TABLE gist_base IN SHARE MODE")
+            cursor.execute(f"LOCK TABLE {TABLE} IN SHARE MODE")
             cursor.execute("LOAD 'vector'")
             settings = {
                 "ivfflat.probes": 64,
@@ -157,17 +167,17 @@ def main():
             cursor.execute("SET LOCAL enable_indexscan=on")
             cursor.execute("SET LOCAL max_parallel_workers_per_gather=0")
             cursor.execute("SET LOCAL statement_timeout=0")
-            cursor.execute("SELECT oid::text, relfilenode::text, reloptions FROM pg_class WHERE oid='gist_ivf_l2'::regclass")
+            cursor.execute("SELECT oid::text, relfilenode::text, reloptions FROM pg_class WHERE oid=%s::regclass", (INDEX,))
             index_identity = cursor.fetchone()
             if index_identity is None or "lists=1000" not in (index_identity[2] or []):
                 raise RuntimeError("gist_ivf_l2 with lists=1000 is required")
 
             sql = ("SELECT id, ctid::text, embedding <-> %s::vector AS distance "
-                   "FROM gist_base ORDER BY embedding <-> %s::vector LIMIT 10")
+                   f"FROM {TABLE} ORDER BY embedding <-> %s::vector LIMIT 10")
             cursor.execute("EXPLAIN (FORMAT JSON) " + sql,
                            (vector_literal(queries[0]), vector_literal(queries[0])))
             plan = cursor.fetchone()[0]
-            if "gist_ivf_l2" not in json.dumps(plan) or "Index Scan" not in json.dumps(plan):
+            if INDEX not in json.dumps(plan) or "Index Scan" not in json.dumps(plan):
                 raise RuntimeError("expected gist_ivf_l2 Index Scan")
             atomic_json(args.output / "plan.json", plan)
             atomic_json(args.output / "manifest.json", {

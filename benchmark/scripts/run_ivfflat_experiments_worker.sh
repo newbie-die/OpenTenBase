@@ -207,7 +207,7 @@ test -d "${PGDATA}"
 COMMON_ARGS=(--host "${DB_HOST}" --port "${DB_PORT}" --dbname "${DB_NAME}" --user "${DB_USER}")
 D2P_RUN_ARGS=()
 if [[ "${PHASE}" == "all-fomal-exp" ]]; then
-    D2P_RUN_ARGS=(--phase all-fomal-exp --dataset gist-l2 --warmup 100 --queries 9000
+    D2P_RUN_ARGS=(--phase all-fomal-exp --dataset gist-l2 --warmup 100 --queries 1000
                   --topk 10 --lists 1000 --output "${RUN_DIR}")
     if [[ "${FORMAL_RESUME}" == "1" ]]; then D2P_RUN_ARGS+=(--resume); fi
     "${PYTHON_BIN}" "${PROFILE_SCRIPT}" "${COMMON_ARGS[@]}" run "${D2P_RUN_ARGS[@]}" --validate-only

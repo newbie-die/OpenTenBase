@@ -17,12 +17,19 @@ if [[ $# -gt 0 ]]; then
     shift
 fi
 
+# Final comparison extends the shared Python/Phase C framework. Its own lock,
+# manifest and explicit --formal gate also support a single foreground nohup job.
+if [[ "${PHASE}" == "final-multi" ]]; then
+    exec "${PYTHON_BIN:-python3}" "${SCRIPT_DIR}/ivfflat_profile.py" final-multi "$@"
+fi
+
 if [[ "${PHASE}" != "all" && "${PHASE}" != "a" && "${PHASE}" != "b" && "${PHASE}" != "2a" && "${PHASE}" != "2a2" && "${PHASE}" != "2a34" && "${PHASE}" != "2b" && "${PHASE}" != "2b-correctness" && "${PHASE}" != "2b-production" && "${PHASE}" != "formal" && "${PHASE}" != "all-fomal-exp" ]]; then
     echo "usage: $0 [all|a|b|2a|2a2|2a34|2b|2b-correctness|2b-production|formal|all-fomal-exp] [phase options]" >&2
     exit 2
 fi
 
 RESUME_RUN_DIR=
+RUN_DIR_OVERRIDE=${RUN_DIR_OVERRIDE:-}
 FOREGROUND=0
 WORKER_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -36,6 +43,13 @@ while [[ $# -gt 0 ]]; do
         fi
         RESUME_RUN_DIR=$2
         WORKER_ARGS+=(--resume)
+        shift 2
+    elif [[ "$1" == "--run-dir" ]]; then
+        if [[ $# -lt 2 ]]; then
+            echo "--run-dir requires a path" >&2
+            exit 2
+        fi
+        RUN_DIR_OVERRIDE=$2
         shift 2
     else
         WORKER_ARGS+=("$1")
@@ -63,6 +77,9 @@ if [[ -n "${RESUME_RUN_DIR}" ]]; then
         exit 2
     fi
     RUN_DIR=$(cd -- "${RESUME_RUN_DIR}" && pwd -P)
+elif [[ -n "${RUN_DIR_OVERRIDE}" ]]; then
+    mkdir -p "${RUN_DIR_OVERRIDE}"
+    RUN_DIR=$(cd -- "${RUN_DIR_OVERRIDE}" && pwd -P)
 else
     RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
     if [[ "${PHASE}" == "all-fomal-exp" ]]; then

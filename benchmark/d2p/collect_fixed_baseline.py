@@ -3,12 +3,22 @@
 import argparse
 import csv
 import json
+import os
 import re
 import statistics
 import time
 from pathlib import Path
 
-DATASET = Path("/workspace/benchmark/data/gist1m/gist-960-euclidean.hdf5")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+RUNTIME_ROOT = Path(os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")).resolve()
+DATASET = Path(os.environ.get("D2P_DATASET",
+                              RUNTIME_ROOT / "data/gist1m/gist-960-euclidean.hdf5"))
+# Dataset parameters share the original collector and feature definitions.
+TABLE = os.environ.get("D2P_TABLE", "gist_base")
+INDEX = os.environ.get("D2P_INDEX", "gist_ivf_l2")
+if (TABLE, INDEX) not in (("gist_base", "gist_ivf_l2"), ("sift_base", "sift_ivf_l2")):
+    raise ValueError("Only audited L2 calibration workloads are allowed")
+
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE_2B (.*)")
 FIELD_RE = re.compile(r"([a-z0-9_]+)=([^ ]+)")
 FIELDS = ("query_id", "probes", "latency_us", "recall_at_10", "result_ids",
@@ -28,7 +38,7 @@ def atomic_json(path, value):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--probes", type=int, choices=(40, 48, 56), required=True)
+    parser.add_argument("--probes", type=int, choices=(16, 32, 40, 48, 56, 64), required=True)
     parser.add_argument("--queries", type=int, default=1000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5432)
@@ -63,7 +73,7 @@ def main():
         with connection.cursor() as cursor:
             cursor.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
             cursor.execute("SET LOCAL lock_timeout=10000")
-            cursor.execute("LOCK TABLE gist_base IN SHARE MODE")
+            cursor.execute(f"LOCK TABLE {TABLE} IN SHARE MODE")
             cursor.execute("LOAD 'vector'")
             settings = {
                 "ivfflat.probes": args.probes,
@@ -80,7 +90,7 @@ def main():
             cursor.execute("SELECT set_config('ivfflat.distance_path','generic',true)")
             cursor.execute("SET LOCAL enable_seqscan=off")
             cursor.execute("SET LOCAL max_parallel_workers_per_gather=0")
-            sql = ("SELECT id FROM gist_base ORDER BY embedding <-> %s::vector LIMIT 10")
+            sql = (f"SELECT id FROM {TABLE} ORDER BY embedding <-> %s::vector LIMIT 10")
             mode = "a" if raw.exists() else "w"
             with raw.open(mode, newline="", buffering=1) as target:
                 writer = csv.DictWriter(target, fieldnames=FIELDS)

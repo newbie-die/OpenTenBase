@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import statistics
 import time
@@ -11,7 +12,10 @@ from pathlib import Path
 
 from calibrate_policy import feature_rows, read_csv
 
-DATASET = Path("/workspace/benchmark/data/gist1m/gist-960-euclidean.hdf5")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+RUNTIME_ROOT = Path(os.environ.get("BENCHMARK_RUNTIME_ROOT", WORKSPACE_ROOT / "benchmark")).resolve()
+DATASET = Path(os.environ.get("D2P_DATASET",
+                              RUNTIME_ROOT / "data/gist1m/gist-960-euclidean.hdf5"))
 PROFILE_RE = re.compile(r"IVFFLAT_PROFILE_2B (.*)")
 PAIR_RE = re.compile(r"([a-z0-9_]+)=([^ ]+)")
 
