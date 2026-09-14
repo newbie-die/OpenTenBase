@@ -102,6 +102,8 @@ PostgreSQL 内的 correctness 和 production 测试还核对了 selected lists�
 /workspace/benchmark/runs/final_multi_formal/final_comparison.json
 ```
 
+随仓库提交的最终汇总、单项生产实验和未采用方案证据见 [`results/`](results/README.md)。其中 `final_multi_comparison.csv` 是当前最终两轮统计的唯一正式汇总；其余 CSV 用于追溯独立实验，不并入 Final Round A/B 的 mean 和 std。
+
 ### 3.2 LIMIT Top-K 优化
 
 | Dataset | Metric | Baseline mean (ms) | Top-K mean (ms) | Speedup | Baseline Recall | Top-K Recall |

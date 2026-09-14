@@ -34,6 +34,7 @@
 最终结果中的 `2A+B` 表示同时启用 2A bounded scan 和 B/FUSED2。阶段 C 是正式验证框架，不是一个单独的查询优化方法。最终表中的方法 `D` 指已经部署的 D2-P 自适应 probes 策略。
 
 面向代码评审和结果复现的简明提交报告见 [`docs/IVFFLAT_OPTIMIZATION.md`](docs/IVFFLAT_OPTIMIZATION.md)。
+重点实验结果 CSV、原始运行路径和完整性哈希见 [`docs/results/README.md`](docs/results/README.md)。
 
 ## 环境依赖
 

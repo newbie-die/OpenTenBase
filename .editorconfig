@@ -103,6 +103,12 @@ indent_size = unset
 trim_trailing_whitespace = unset
 insert_final_newline = unset
 
+[benchmark/docs/results/*.csv]
+indent_style = unset
+indent_size = unset
+trim_trailing_whitespace = unset
+insert_final_newline = unset
+
 [ppport.h]
 indent_style = unset
 indent_size = unset
