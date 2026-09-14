@@ -33,7 +33,131 @@
 
 最终结果中的 `2A+B` 表示同时启用 2A bounded scan 和 B/FUSED2。阶段 C 是正式验证框架，不是一个单独的查询优化方法。最终表中的方法 `D` 指已经部署的 D2-P 自适应 probes 策略。
 
-## 运行前提
+## 环境依赖
+
+### 硬件与操作系统
+
+- 使用 Linux 环境；调度脚本依赖 Bash、POSIX 文件权限、进程信号和文件锁。
+- 当前冻结的编译参数包含 `-march=haswell -mavx2 -mfma`，运行 CPU 必须支持 AVX2 和 FMA。正式复现时不要擅自改变这些参数，否则 binary identity 和性能结果不可直接比较。
+- 正式实验会同时保存多个 `vector.so`、隔离源码副本、checkpoint 和 raw CSV。数据集及数据库占用不计入仓库，运行前应确认 `/workspace/benchmark` 和 PostgreSQL 数据目录有足够空间。
+
+### 编译与系统工具
+
+需要以下命令可从 `PATH` 找到，或位于下面的默认安装路径：
+
+| 依赖 | 用途 |
+| --- | --- |
+| GCC 11.5.0 | 编译 pgvector、FUSED2、D2-P 和 C/Python 特性一致性程序；Phase C 会严格检查该版本 |
+| GNU Make | 构建 `contrib/pgvector` |
+| Git | 记录源码提交和 dirty diff；Phase C 使用 detached worktree 构建 pristine binary |
+| GNU binutils | `objdump`、`strings`、`nm` 用于检查汇编、profiling 字符串和未解析符号 |
+| coreutils | `sha256sum`、`sort`、`tee` 等用于生成身份和运行证据 |
+| util-linux | 非 PostgreSQL OS 用户运行时通过 `runuser` 切换到数据库用户 |
+| OpenTenBase/PostgreSQL 开发环境 | 提供 `pg_config`、`pg_ctl`、server headers、client 和运行中的数据库实例 |
+
+当前验证环境为：
+
+```text
+Python       3.9.25
+GCC          11.5.0
+GNU Make     4.3
+PostgreSQL   18.6（由 /workspace/install/bin/pg_config 报告）
+CPU flags    Haswell / AVX2 / FMA
+```
+
+可执行以下命令检查核心工具：
+
+```bash
+python3 --version
+gcc -dumpfullversion
+make --version | head -1
+git --version
+/workspace/install/bin/pg_config --version
+/workspace/install/bin/pg_ctl --version
+command -v objdump strings nm sha256sum runuser
+grep -m1 '^flags' /proc/cpuinfo | grep -qw avx2
+grep -m1 '^flags' /proc/cpuinfo | grep -qw fma
+```
+
+### Python 依赖
+
+Python 至少需要 3.9。基础 A/B/C runner 使用 NumPy、h5py 和 psycopg2；Final Multi 读取 Cohere Parquet 时还需要 PyArrow，SIFT D 校准和 `benchmark/d2/` 离线分析还需要 scikit-learn。
+
+| Python 包 | 当前验证版本 | 用途 |
+| --- | ---: | --- |
+| `numpy` | 2.0.2 | 向量、统计、归一化和 percentile |
+| `h5py` | 3.14.0 | 读取 GIST、SIFT 和 GloVe HDF5 数据 |
+| `psycopg2-binary` | 2.9.12 | 连接 OpenTenBase/PostgreSQL |
+| `pyarrow` | 21.0.0 | 读取 Cohere Parquet 数据和 ground truth |
+| `scikit-learn` | 1.6.1 | D/D2-P 的决策树、GBDT、校准和离线审计 |
+
+标准环境使用 `/workspace/benchmark/.venv`。新环境可以按当前已验证版本创建：
+
+```bash
+python3.9 -m venv /workspace/benchmark/.venv
+/workspace/benchmark/.venv/bin/python -m pip install --upgrade pip
+/workspace/benchmark/.venv/bin/python -m pip install \
+  numpy==2.0.2 \
+  h5py==3.14.0 \
+  psycopg2-binary==2.9.12 \
+  pyarrow==21.0.0 \
+  scikit-learn==1.6.1
+```
+
+`/workspace/benchmark/requirements.txt` 只覆盖基础 runner 的三个包。执行 Final Multi 或 D 阶段时仍需安装上表中的 PyArrow 和 scikit-learn。统一入口默认优先使用 `/workspace/benchmark/.venv/bin/python`，也可以通过 `--python /path/to/python` 显式指定解释器。
+
+检查 Python 环境：
+
+```bash
+/workspace/benchmark/.venv/bin/python - <<'PY'
+import h5py
+import numpy
+import psycopg2
+import pyarrow
+import sklearn
+
+print('numpy', numpy.__version__)
+print('h5py', h5py.__version__)
+print('psycopg2', psycopg2.__version__)
+print('pyarrow', pyarrow.__version__)
+print('scikit-learn', sklearn.__version__)
+PY
+```
+
+### OpenTenBase、数据库与权限
+
+- OpenTenBase 应已编译并安装到 `/workspace/install`；`/workspace/install/bin/pg_config` 必须与要运行的 server 和扩展安装目录一致。
+- PostgreSQL 数据目录默认为 `/workspace/data`，数据库 OS 用户默认为 `dev`。需要重新编译或切换 `vector.so` 的阶段必须有权停止、安装并重新启动这个实例；可由 `dev` 直接运行，也可由 root 通过 `runuser` 执行。
+- 默认数据库是 `taskdb`，连接用户是 `dev`。该用户需要读取 benchmark 表、设置实验使用的 `ivfflat.*` GUC，并执行查询与元数据检查。
+- 数据库需要安装当前源码对应的 vector 扩展。Final Multi 所需表和索引是 `gist_base/gist_ivf_l2`、`sift_base/sift_ivf_l2`、`glove_base/glove_ivf_cosine`、`glove_ip_base/glove_ivf_ip` 和 `cohere_base/cohere_ivf_cosine`，索引均使用 `lists=1000`。
+- Phase C 需要环境变量 `PRISTINE_COMMIT` 指向可解析且可建立 detached worktree 的提交。正式 resume 必须继续使用 Part 1 记录的同一提交。
+
+可先检查服务和扩展：
+
+```bash
+/workspace/install/bin/pg_ctl -D /workspace/data status
+/workspace/install/bin/psql \
+  -h 127.0.0.1 -p 5432 -U dev -d taskdb \
+  -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
+```
+
+### 数据集
+
+数据路径由 [`configs/final_multi_datasets.json`](configs/final_multi_datasets.json) 定义，相对路径均以运行根目录为基准。标准布局需要：
+
+```text
+/workspace/benchmark/data/gist1m/gist-960-euclidean.hdf5
+/workspace/benchmark/data/gist1m/gist-960-euclidean-formal.hdf5
+/workspace/benchmark/data/sift1m/sift-128-euclidean.hdf5
+/workspace/benchmark/data/glove100/glove-100-angular.hdf5
+/workspace/benchmark/data/cohere1m/shuffle_train.parquet
+/workspace/benchmark/data/cohere1m/test.parquet
+/workspace/benchmark/data/cohere1m/neighbors.parquet
+```
+
+Final Multi 的 preparation 会检查文件 SHA256、维度、行数、base ID 与向量映射、ground truth、查询切分、索引 opclass 和 EXPLAIN 计划。任一检查失败都应先修复环境或数据，不应跳过 preparation 直接运行 formal。
+
+## 运行前提与默认路径
 
 默认路径如下：
 
