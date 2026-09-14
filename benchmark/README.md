@@ -34,7 +34,15 @@
 最终结果中的 `2A+B` 表示同时启用 2A bounded scan 和 B/FUSED2。阶段 C 是正式验证框架，不是一个单独的查询优化方法。最终表中的方法 `D` 指已经部署的 D2-P 自适应 probes 策略。
 
 面向代码评审和结果复现的简明提交报告见 [`docs/IVFFLAT_OPTIMIZATION.md`](docs/IVFFLAT_OPTIMIZATION.md)。
-重点实验结果 CSV、原始运行路径和完整性哈希见 [`docs/results/README.md`](docs/results/README.md)。
+重点实验结果 CSV、原始运行路径和完整性哈希见 [`docs/results/README.md`](docs/results/README.md)。以下已提交的结果表可直接查看：
+
+| 结果表 | 内容 |
+| --- | --- |
+| [`final_multi_comparison.csv`](docs/results/final_multi_comparison.csv) | 多数据集最终正式对照结果 |
+| [`fused2_production_summary.csv`](docs/results/fused2_production_summary.csv) | FUSED2 独立生产实验汇总 |
+| [`d2p_gist_comparison.csv`](docs/results/d2p_gist_comparison.csv) | D2-P 与固定 probes 的 GIST 对照 |
+| [`page_pruning_probe_summary.csv`](docs/results/page_pruning_probe_summary.csv) | D-0B page pruning 机制实验 |
+| [`partial_distance_kernel_summary.csv`](docs/results/partial_distance_kernel_summary.csv) | D1.2b partial-distance 内核实验 |
 
 ## 环境依赖
 
